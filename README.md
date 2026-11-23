@@ -101,3 +101,63 @@ Level 1 benchmark verification passed **7/7 tests** across multilingual semantic
 ### 3. Pipeline Invariance & Idempotency
 - Re-running `seed.py` produces **zero duplicate records** across both relational tables and the Qdrant vector index.
 - Vector point count remains invariant at 30 points.
+
+---
+
+## Level 2: Gemini LLM Layer & IC³-WB Self-Augmentation
+
+Level 2 introduces an LLM layer powered by Google Gemini together with an autonomous, reviewer-less self-augmentation engine: **IC³-WB** (*Identity-Checked, Copy-aware Consensus with Calibrated Write-Back*).
+
+### Core Design Principle
+> **Gemini only READS and WRITES text.**  
+> It classifies user intent, extracts factual claims with verbatim evidence quotes, and synthesizes final answers. Every **accept**, **reject**, **conflict**, and **write-back** decision is strictly executed by deterministic, unit-tested Python code using configurable thresholds.  
+> $\text{Same input} + \text{Same config} \implies \text{Same decision}$.
+
+### Configurable Thresholds & Parameters
+All thresholds reside in code/configuration, are documented here, and are audited in `augment_jobs.config` for every self-augmentation job:
+
+| Parameter | Value | Location | Purpose & Scientific Rationale |
+| :--- | :--- | :--- | :--- |
+| `IDENTITY_SIM_THRESHOLD` | `0.55` | `chat_pipeline.py` | Minimum `pg_trgm` similarity required between user entity query and candidate site name/aliases to prevent entity drift. |
+| `RETRIEVAL_SCORE_THRESHOLD` | `0.45` | `chat_pipeline.py` | Dense vector cosine similarity cutoff below which IC³-WB self-augmentation is triggered. |
+| `MINHASH_JACCARD_THRESHOLD` | `0.70` | `content_dedup.py` | Character 3-shingle MinHash Jaccard similarity cutoff for copycat scrapers / syndication clustering. |
+| `TIER_A_PRIOR` | `1.0` | `003_self_augment.sql` | Base reliability for official government & heritage domains (`.gov.in`, `.nic.in`, `asi.nic.in`, `hrce.tn.gov.in`, `whc.unesco.org`). |
+| `TIER_B_PRIOR` | `0.6` | `003_self_augment.sql` | Base reliability for encyclopedic & reputable academic/news outlets (`wikipedia.org`, `*.edu`, `thehindu.com`). |
+| `TIER_C_PRIOR` | `0.25` | `003_self_augment.sql` | Base reliability for general blogs, commercial travel guides, and uncurated websites. |
+| `CONSENSUS_TIER_A_WEIGHT` | `1.0` | `fact_consensus.py` | Minimum support weight from a Tier A authoritative source required to verify a claim immediately. |
+| `CONSENSUS_MULTI_CLUSTER_WEIGHT` | `1.2` | `fact_consensus.py` | Minimum cumulative support across $\ge 2$ independent clusters required for Tier B/C claims. |
+| `CONFLICT_DELTA_THRESHOLD` | `0.3` | `fact_consensus.py` | Difference threshold between top competing claims; $|S_1 - S_2| \le 0.3$ with $S_1, S_2 \ge 0.8$ yields `conflict`. |
+| `AUGMENT_BUDGET_HOURS` | `24` | `augment_orchestrator.py` | Cooldown period per `candidate_key` preventing redundant external queries and quota exhaustion. |
+
+### IC³-WB Algorithm Stages
+```mermaid
+flowchart TD
+    A["User Query (e.g. 'pariyur amman temple')"] --> B["Dense Vector Search (Qdrant)"]
+    B --> C{"Identity Check & Score >= 0.45?"}
+    C -- "Yes" --> D["DB Path: Extractive / Synthesized Answer"]
+    C -- "No & Entity Named" --> E["IC3-WB Engine Triggered"]
+    
+    subgraph IC3WB ["IC3-WB Self-Augmentation Engine"]
+        E --> F["1. Multi-Source Search & Fetch (Tier A/B/C)"]
+        F --> G["2. Exact SHA-256 Dedup & Character 3-Shingle MinHash"]
+        G --> H["3. Quote-Anchored Fact Extraction (Hallucination Defense)"]
+        H --> I["4. Calibrated Consensus Scoring & Conflict Detection"]
+        I --> J{"5. Write-Back Gate: Core Fields Verified?"}
+        J -- "Pass" --> K["6. Allocate Next Site ID (TN-DIST-SEQ)"]
+        K --> L["7. Atomic Write-Back: Postgres + Qdrant"]
+        J -- "Fail" --> M["Reject / Non-Existent Record (No Write-Back)"]
+    end
+    
+    L --> N["Re-Retrieve from Qdrant"]
+    N --> O["Grounded Synthesis (path='web_consensus')"]
+    M --> P["Polite Refusal (path='rejected')"]
+```
+
+1. **Identity-Checked Gating**: When a user mentions a specific entity (e.g., "pariyur amman temple"), the system verifies whether top retrieved candidates match the target entity (trigram similarity $\ge 0.55$ and matching district). If similarity fails, drift is blocked (preventing Bannari Amman from answering Pariyur Amman).
+2. **Multi-Source Collection**: Retrieves candidate URLs across Tier A (`asi.nic.in`, `hrce.tn.gov.in`, `tnarch.gov.in`), Tier B (Wikipedia, reputable press), and Tier C.
+3. **Copy-Aware Clustering**: Computes SHA-256 for identical pages, plus MinHash signatures over character 3-shingles with Jaccard similarity $\ge 0.70$. Scraped/syndicated copycats are grouped into a single cluster to prevent false consensus.
+4. **Quote-Anchored Extraction (Hallucination Defense)**: Gemini extracts candidate facts (`builder`, `period`, `deity`, `history`, `overview`), but every claim **must include a verbatim quote**. If the quote does not exist as an exact substring in the retrieved web page, the claim is dropped immediately.
+5. **Calibrated Consensus Scoring**: Computes claim weight $W_c = \max_{s \in \text{cluster}} (\text{tier\_prior}_s \times \text{reliability}_s)$. Evaluates whether a claim is `verified`, `conflict`, or `rejected`.
+6. **Dual Atomic Write-Back**: Only candidates meeting all core fields (`name_en`, `primary_category`, `district_id`, `overview`, `history`/`period`/`builder`) pass write-back gating. Sequential site IDs (`TN-<DIST>-<SEQ>`) are allocated, and records are atomically persisted to PostgreSQL (`sites`, `site_facts`, `chunk_registry`) and Qdrant (`heritage_chunks`).
+7. **Immediate Re-retrieval & Provenance Tracking**: Re-queries Qdrant for newly created vectors, synthesizes the answer with citations (`origin="web_consensus"`), and logs full audit metadata to `augment_jobs`, `augment_sources`, `evidence_ledger`, `field_decisions`, and `query_logs`.
+

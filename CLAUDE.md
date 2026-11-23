@@ -35,12 +35,20 @@ TAMIL HERITAGE RAG/
 │  │  ├─ core/config.py      # Pydantic Settings
 │  │  ├─ db/postgres.py      # SQLAlchemy 2.x engine + psycopg 3 session
 │  │  ├─ db/qdrant.py        # Qdrant client + ensure_collection()
-│  │  ├─ services/embeddings.py # BAAI/bge-m3 singleton service
-│  │  ├─ services/ingest.py  # Ingestion logic into Qdrant & chunk_registry
-│  │  ├─ api/routes/         # health, sites, search, admin
+│  │  ├─ services/
+│  │  │  ├─ embeddings.py    # BAAI/bge-m3 singleton service
+│  │  │  ├─ ingest.py        # Ingestion logic into Qdrant & chunk_registry
+│  │  │  ├─ gemini.py        # Google Gemini LLM API client, query classification, grounded answer synthesis
+│  │  │  ├─ domain_tiers.py  # Domain tiers (A/B/C) and Bayesian Beta reliability updates
+│  │  │  ├─ content_dedup.py # Exact SHA-256 and MinHash character 3-shingle clustering
+│  │  │  ├─ fact_consensus.py# Deterministic consensus rules, normalizers, conflict detection
+│  │  │  ├─ writeback.py     # Calibrated writeback gating & dual atomic persistence
+│  │  │  ├─ augment_orchestrator.py # IC³-WB self-augmentation pipeline orchestrator
+│  │  │  └─ chat_pipeline.py # Conversational pipeline with identity verification & augmentation fallback
+│  │  ├─ api/routes/         # health, sites, search, admin, chat, users
 │  │  └─ schemas/            # Pydantic models
 │  ├─ db/
-│  │  ├─ migrations/         # 001_init.sql
+│  │  ├─ migrations/         # 001_init.sql, 002_level1b.sql, 003_self_augment.sql
 │  │  └─ seed/               # seed.sql, chunks.json, seed_chat.sql
 │  ├─ scripts/
 │  │  ├─ migrate.py          # Applies migrations with schema_migrations table
