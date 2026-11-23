@@ -24,40 +24,65 @@ from app.main import app
 client = TestClient(app)
 
 
-def test_database_and_vector_counts():
-    """Verify table row counts and vector points counts match Level 1 specifications."""
-    with SessionLocal() as db:
-        sites_cnt = db.execute(sa_text("SELECT count(*) FROM sites")).scalar()
-        aliases_cnt = db.execute(sa_text("SELECT count(*) FROM site_aliases")).scalar()
-        categories_cnt = db.execute(sa_text("SELECT count(*) FROM categories")).scalar()
-        locations_cnt = db.execute(sa_text("SELECT count(*) FROM locations")).scalar()
-        chunk_reg_cnt = db.execute(sa_text("SELECT count(*) FROM chunk_registry")).scalar()
-        messages_cnt = db.execute(sa_text("SELECT count(*) FROM chat_messages")).scalar()
-        citations_cnt = db.execute(sa_text("SELECT count(*) FROM message_citations")).scalar()
+LEVEL1_SITE_IDS = {
+    "TN-CGL-0001", "TN-CHN-0001", "TN-ERD-0001", "TN-KNK-0001", "TN-KNK-0002",
+    "TN-MDU-0001", "TN-SVG-0001", "TN-TNJ-0001", "TN-TNJ-0002", "TN-VPM-0001",
+}
+LEVEL1_CATEGORIES = {
+    "temple", "monument", "museum", "fort", "palace", "rock_cut", "archaeological_site",
+    "memorial", "heritage_tourist_spot", "unesco", "asi_protected",
+}
 
-        assert sites_cnt == 10, f"Expected 10 sites, got {sites_cnt}"
-        assert aliases_cnt == 25, f"Expected 25 aliases, got {aliases_cnt}"
-        assert categories_cnt == 11, f"Expected 11 categories, got {categories_cnt}"
-        assert locations_cnt == 22, f"Expected 22 locations, got {locations_cnt}"
-        assert chunk_reg_cnt == 30, f"Expected 30 chunk_registry rows, got {chunk_reg_cnt}"
-        assert messages_cnt == 16, f"Expected 16 chat_messages, got {messages_cnt}"
-        assert citations_cnt == 11, f"Expected 11 citations, got {citations_cnt}"
+# Tables that later levels only ever grow; snapshot them for idempotency checks.
+COUNTED_TABLES = [
+    "sites", "site_aliases", "categories", "locations", "chunk_registry",
+    "chat_messages", "message_citations",
+]
 
-        # Verify Qdrant points count
-        qdrant = get_qdrant_client()
-        col_info = qdrant.get_collection(settings.QDRANT_COLLECTION)
-        assert col_info.points_count == 30, f"Expected 30 Qdrant points, got {col_info.points_count}"
 
-        # Verify identical point ID sets
-        db_chunk_ids = {str(r[0]) for r in db.execute(sa_text("SELECT chunk_id FROM chunk_registry")).fetchall()}
-        points, _ = qdrant.scroll(
-            collection_name=settings.QDRANT_COLLECTION,
-            limit=100,
-            with_payload=False,
-            with_vectors=False
+def _all_qdrant_ids() -> set:
+    """Scroll the whole collection (paginated; Level 1B has far more than 100 points)."""
+    qdrant = get_qdrant_client()
+    ids, offset = set(), None
+    while True:
+        points, offset = qdrant.scroll(
+            collection_name=settings.QDRANT_COLLECTION, limit=1000, offset=offset,
+            with_payload=False, with_vectors=False,
         )
-        qdrant_point_ids = {str(p.id) for p in points}
-        assert db_chunk_ids == qdrant_point_ids, "PostgreSQL chunk_registry IDs must match Qdrant point IDs exactly"
+        ids.update(str(p.id) for p in points)
+        if offset is None:
+            return ids
+
+
+def _snapshot() -> dict:
+    with SessionLocal() as db:
+        counts = {t: db.execute(sa_text(f"SELECT count(*) FROM {t}")).scalar() for t in COUNTED_TABLES}
+    counts["qdrant_points"] = get_qdrant_client().get_collection(settings.QDRANT_COLLECTION).points_count
+    return counts
+
+
+def test_database_and_vector_counts():
+    """Level 1 seed is intact (later levels may only add) and PG/Qdrant ids match exactly."""
+    with SessionLocal() as db:
+        site_ids = {r[0] for r in db.execute(sa_text("SELECT site_id FROM sites"))}
+        assert LEVEL1_SITE_IDS <= site_ids, f"Missing Level 1 sites: {LEVEL1_SITE_IDS - site_ids}"
+
+        cats = {r[0] for r in db.execute(sa_text("SELECT code FROM categories"))}
+        assert LEVEL1_CATEGORIES <= cats, f"Missing Level 1 categories: {LEVEL1_CATEGORIES - cats}"
+
+        seed_aliases = db.execute(sa_text(
+            "SELECT count(*) FROM site_aliases WHERE site_id = ANY(:ids)"), {"ids": list(LEVEL1_SITE_IDS)}).scalar()
+        assert seed_aliases >= 25, f"Expected >= 25 aliases on Level 1 sites, got {seed_aliases}"
+
+        assert db.execute(sa_text("SELECT count(*) FROM locations")).scalar() >= 22
+        assert db.execute(sa_text("SELECT count(*) FROM chunk_registry")).scalar() >= 30
+        assert db.execute(sa_text("SELECT count(*) FROM chat_messages")).scalar() >= 16
+        assert db.execute(sa_text("SELECT count(*) FROM message_citations")).scalar() >= 11
+
+        db_chunk_ids = {str(r[0]) for r in db.execute(sa_text("SELECT chunk_id FROM chunk_registry"))}
+
+    qdrant_point_ids = _all_qdrant_ids()
+    assert db_chunk_ids == qdrant_point_ids, "PostgreSQL chunk_registry IDs must match Qdrant point IDs exactly"
 
 
 def test_search_tamil_big_temple():
@@ -126,30 +151,20 @@ def test_sites_fuzzy_search():
 def test_seed_idempotency():
     """Running seed.py (all steps) a second time must NOT change any counts.
 
-    This guards against accidental duplicate inserts across all seed steps.
+    Compares a before/after snapshot, so it stays valid as Level 1B adds data.
     """
     import subprocess
     import sys
+    from pathlib import Path
 
-    # Determine the venv python that is running pytest
-    python_exe = sys.executable
-
+    project_root = Path(__file__).resolve().parents[2]
+    before = _snapshot()
     result = subprocess.run(
-        [python_exe, "server/scripts/seed.py"],
-        capture_output=True,
-        text=True,
-        cwd="D:\\2026\\BIT\\PAPER\\TAMIL HERITAGE RAG",
+        [sys.executable, str(project_root / "server" / "scripts" / "seed.py")],
+        capture_output=True, text=True, cwd=str(project_root),
     )
     # seed.py exits 0 even when rows already exist (idempotent by design)
     assert result.returncode == 0, f"seed.py re-run failed:\n{result.stderr}"
-
-    with SessionLocal() as db:
-        assert db.execute(sa_text("SELECT count(*) FROM sites")).scalar() == 10, "sites count changed after re-seed"
-        assert db.execute(sa_text("SELECT count(*) FROM site_aliases")).scalar() == 25, "aliases count changed"
-        assert db.execute(sa_text("SELECT count(*) FROM chunk_registry")).scalar() == 30, "chunk_registry count changed"
-        assert db.execute(sa_text("SELECT count(*) FROM chat_messages")).scalar() == 16, "chat_messages count changed"
-        assert db.execute(sa_text("SELECT count(*) FROM message_citations")).scalar() == 11, "citations count changed"
-
-    qdrant = get_qdrant_client()
-    info = qdrant.get_collection(settings.QDRANT_COLLECTION)
-    assert info.points_count == 30, f"Qdrant points changed after re-seed: {info.points_count}"
+    after = _snapshot()
+    changed = {k: (before[k], after[k]) for k in before if before[k] != after[k]}
+    assert not changed, f"Counts changed after re-seed (before, after): {changed}"

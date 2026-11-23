@@ -1,0 +1,17 @@
+rule_id,rule_description,hits
+R01,Rule R01,3
+R02,Rule R02,5
+R04,Rule R04,50
+R05,Rule R05,12
+R06,Rule R06,152
+R07,Rule R07,42
+R08,Rule R08,14
+R09,Rule R09,32
+R10,Rule R10,5
+R11,Rule R11,148
+R12,Rule R12,5
+R13,Rule R13,1
+R14,Rule R14,11
+R15,Rule R15,3
+R16,Rule R16,17
+R17,Rule R17,8

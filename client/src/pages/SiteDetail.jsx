@@ -1,16 +1,23 @@
 import React, { useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { fetchSiteDetail } from '../api/client';
 
 export default function SiteDetail({ siteId, onBack }) {
+  const params = useParams();
+  const navigate = useNavigate();
+  const effectiveSiteId = siteId || params.siteId;
+  const handleBack = onBack || (() => navigate('/explorer/sites'));
+
   const [site, setSite] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   useEffect(() => {
     async function load() {
+      if (!effectiveSiteId) return;
       setLoading(true);
       try {
-        const data = await fetchSiteDetail(siteId);
+        const data = await fetchSiteDetail(effectiveSiteId);
         setSite(data);
         setError(null);
       } catch (err) {
@@ -20,7 +27,7 @@ export default function SiteDetail({ siteId, onBack }) {
       }
     }
     load();
-  }, [siteId]);
+  }, [effectiveSiteId]);
 
   if (loading) {
     return <div style={{ padding: '2rem', textAlign: 'center' }}>Loading site details...</div>;
@@ -30,7 +37,7 @@ export default function SiteDetail({ siteId, onBack }) {
     return (
       <div className="card">
         <div style={{ color: 'var(--accent-red)' }}>Error: {error || 'Site not found'}</div>
-        <button className="btn btn-secondary" style={{ marginTop: '1rem' }} onClick={onBack}>
+        <button className="btn btn-secondary" style={{ marginTop: '1rem' }} onClick={handleBack}>
           ← Back to Sites
         </button>
       </div>

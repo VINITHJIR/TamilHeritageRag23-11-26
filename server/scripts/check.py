@@ -36,6 +36,10 @@ TABLES_TO_CHECK = [
     "message_citations",
     "message_feedback",
     "query_logs",
+    # Level 1B (002_level1b.sql)
+    "site_source_keys",
+    "ingestion_runs",
+    "review_queue",
 ]
 
 

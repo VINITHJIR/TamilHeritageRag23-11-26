@@ -1,7 +1,11 @@
 import React, { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { fetchSites } from '../api/client';
 
 export default function Sites({ onSelectSite }) {
+  const navigate = useNavigate();
+  const handleSelect = onSelectSite || ((id) => navigate(`/explorer/sites/${encodeURIComponent(id)}`));
+
   const [sites, setSites] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -154,7 +158,7 @@ export default function Sites({ onSelectSite }) {
                   <button
                     className="btn btn-secondary"
                     style={{ padding: '0.3rem 0.7rem', fontSize: '0.85rem' }}
-                    onClick={() => onSelectSite(site.site_id)}
+                    onClick={() => handleSelect(site.site_id)}
                   >
                     View Details →
                   </button>

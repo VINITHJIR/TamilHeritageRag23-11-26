@@ -1,7 +1,11 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { searchChunks } from '../api/client';
 
 export default function Search({ onSelectSite }) {
+  const navigate = useNavigate();
+  const handleSelect = onSelectSite || ((id) => navigate(`/explorer/sites/${encodeURIComponent(id)}`));
+
   const [query, setQuery] = useState('');
   const [topK, setTopK] = useState(5);
   const [filters, setFilters] = useState({
@@ -193,7 +197,7 @@ export default function Search({ onSelectSite }) {
                     <button
                       className="btn btn-secondary"
                       style={{ fontSize: '0.75rem', padding: '0.2rem 0.5rem' }}
-                      onClick={() => onSelectSite(item.site_id)}
+                      onClick={() => handleSelect(item.site_id)}
                     >
                       {item.site_id} →
                     </button>
