@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # Google Gemini LLM Settings
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-flash-lite-latest"
     GEMINI_TIMEOUT_SEC: float = 30.0
 
     # CORS Origins

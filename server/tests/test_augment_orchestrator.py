@@ -72,34 +72,48 @@ def test_orchestrator_fail_insufficient_claims():
                 }
             ]
 
+        mock_classification = {
+            "is_heritage": True,
+            "entity_name": unique_name,
+            "entity_name_ta": None,
+            "place_name": "Nilgiris",
+            "district_id": 11,
+            "question_type": "history",
+            "lang": "en",
+        }
+
         res = None
+        res2 = None
         try:
-            res = run_augmentation_pipeline(
-                query=f"Tell me about {unique_name} in Nilgiris",
-                db=db,
-                search_fn=mock_search,
-                page_fetcher=mock_fetcher,
-                claims_extractor=mock_claims,
-            )
+            with patch("app.services.augment_orchestrator.classify_query", return_value=mock_classification):
+                res = run_augmentation_pipeline(
+                    query=f"Tell me about {unique_name} in Nilgiris",
+                    db=db,
+                    search_fn=mock_search,
+                    page_fetcher=mock_fetcher,
+                    claims_extractor=mock_claims,
+                )
 
-            assert res.status in ("rejected_nonexistent", "failed")
-            assert res.site_id is None
-            assert "Missing required" in res.decision_reason
+                assert res.status in ("rejected_nonexistent", "failed")
+                assert res.site_id is None
+                assert "Missing required" in res.decision_reason
 
-            # Test 24-hour budget rate-limit: second run for identical candidate_key returns skipped_budget
-            res2 = run_augmentation_pipeline(
-                query=f"Tell me about {unique_name} in Nilgiris",
-                db=db,
-                search_fn=mock_search,
-                page_fetcher=mock_fetcher,
-                claims_extractor=mock_claims,
-            )
-            assert res2.status == "skipped_budget"
-            assert "24-hour augmentation budget" in res2.decision_reason
+                # Test 24-hour budget rate-limit: second run for identical candidate_key returns skipped_budget
+                res2 = run_augmentation_pipeline(
+                    query=f"Tell me about {unique_name} in Nilgiris",
+                    db=db,
+                    search_fn=mock_search,
+                    page_fetcher=mock_fetcher,
+                    claims_extractor=mock_claims,
+                )
+                assert res2.status == "skipped_budget"
+                assert "24-hour augmentation budget" in res2.decision_reason
         finally:
             if res:
                 db.execute(sa_text("DELETE FROM augment_jobs WHERE job_id = :jid"), {"jid": res.job_id})
-                db.commit()
+            if res2 and res2.job_id:
+                db.execute(sa_text("DELETE FROM augment_jobs WHERE job_id = :jid"), {"jid": res2.job_id})
+            db.commit()
 
 
 def test_orchestrator_pass_verified_site():

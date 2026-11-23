@@ -14,11 +14,6 @@ import httpx
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 from app.core.config import settings
-from app.services.chat_pipeline import (
-    classify_question_type as rule_classify_question_type,
-    detect_language as rule_detect_language,
-    extract_entity_name as rule_extract_entity_name,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +151,12 @@ def classify_query(text: str, db: Optional[Session] = None) -> Dict[str, Any]:
       question_type: str
       lang: str
     """
+    from app.services.chat_pipeline import (
+        classify_question_type as rule_classify_question_type,
+        detect_language as rule_detect_language,
+        extract_entity_name as rule_extract_entity_name,
+    )
+
     clean_text = text.strip()
 
     # If GEMINI_API_KEY is not configured or in unit test mode without key, fallback to rule-based

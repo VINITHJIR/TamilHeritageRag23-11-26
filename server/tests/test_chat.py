@@ -17,6 +17,7 @@ Covers:
 """
 
 import uuid
+from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sa_text
@@ -342,12 +343,13 @@ def test_get_session_messages_history():
 # -----------------------------------------------------------------------------
 # Regression Tests for Phase 0 Bug Fixes
 # -----------------------------------------------------------------------------
-def test_identity_check_pariyur_rejected():
+@patch("app.services.augment_orchestrator.default_web_search", return_value=[])
+def test_identity_check_pariyur_rejected(mock_search):
     """Identity bug regression test:
 
     'pariyur amman temple pathi sollu' mentions Pariyur Amman Temple (not in DB).
     Must NOT drift to Bannari Amman Temple (TN-ERD-0001).
-    Must return path='rejected' with citations=[].
+    When augmentation fails/has no sources, must return path='rejected' with citations=[].
     """
     guest_res = client.post("/api/users/guest")
     user_id = guest_res.json()["user_id"]
@@ -366,6 +368,141 @@ def test_identity_check_pariyur_rejected():
     assert asst["resolved_site"] is None or asst["resolved_site"] != "TN-ERD-0001"
     for cit in asst["citations"]:
         assert cit["site_id"] != "TN-ERD-0001"
+
+
+@patch("app.services.augment_orchestrator.classify_query")
+@patch("app.services.chat_pipeline.gemini_synthesize_answer")
+@patch("app.services.augment_orchestrator.default_web_search")
+@patch("app.services.augment_orchestrator.fetch_page_content")
+@patch("app.services.augment_orchestrator.extract_claims")
+def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_search, mock_synth, mock_classify):
+    """Phase 4: 'pariyur amman temple pathi sollu' triggers self-augmentation.
+
+    With mock web fetcher, extractor, classifier, and synthesizer, verifies:
+    - path == 'web_consensus'
+    - citations origin == 'web_consensus'
+    - citations trust in ('official', 'multi_source')
+    - query_logs path_detail records augment_job_id
+    """
+    mock_classify.return_value = {
+        "is_heritage": True,
+        "entity_name": "Pariyur Kondathu Kaliamman Temple",
+        "entity_name_ta": "பரியூர் கொண்டத்து காளியம்மன் கோவில்",
+        "place_name": "Gobichettipalayam",
+        "district_id": 5,
+        "question_type": "history",
+        "lang": "ta-Latn",
+    }
+    mock_synth.return_value = "Pariyur Kondathu Kaliamman Temple is located near Gobichettipalayam in Erode district."
+
+    guest_res = client.post("/api/users/guest")
+    user_id = guest_res.json()["user_id"]
+    session_id = client.post("/api/chat/sessions", json={"user_id": user_id}).json()["session_id"]
+
+    mock_search.return_value = [
+        "https://asi.nic.in/pariyur_temple",
+        "https://en.wikipedia.org/wiki/Pariyur_Kondathu_Kaliamman_Temple",
+    ]
+
+    pariyur_page = (
+        "Pariyur Kondathu Kaliamman Temple is an ancient temple situated near Gobichettipalayam in Erode district. "
+        "The current stone temple was built during the 17th century Nayaka period. "
+        "The presiding deity is Goddess Kondathu Kaliamman."
+    )
+    mock_fetch.return_value = (pariyur_page, 200, "https://asi.nic.in/pariyur_temple")
+
+    mock_extract.return_value = [
+        {
+            "field": "primary_category",
+            "raw_value": "temple",
+            "norm_value": "temple",
+            "evidence_quote": "ancient temple",
+            "quote_found": True,
+        },
+        {
+            "field": "overview",
+            "raw_value": "Pariyur Kondathu Kaliamman Temple is an ancient temple situated near Gobichettipalayam in Erode district.",
+            "norm_value": "Pariyur Kondathu Kaliamman Temple is an ancient temple situated near Gobichettipalayam in Erode district.",
+            "evidence_quote": "Pariyur Kondathu Kaliamman Temple is an ancient temple situated near Gobichettipalayam in Erode district",
+            "quote_found": True,
+        },
+        {
+            "field": "history",
+            "raw_value": "The current stone temple was built during the 17th century Nayaka period.",
+            "norm_value": "The current stone temple was built during the 17th century Nayaka period.",
+            "evidence_quote": "The current stone temple was built during the 17th century Nayaka period",
+            "quote_found": True,
+        },
+        {
+            "field": "period",
+            "raw_value": "17th century",
+            "norm_value": "17th century CE",
+            "evidence_quote": "17th century",
+            "quote_found": True,
+        },
+        {
+            "field": "dynasty",
+            "raw_value": "Nayaka",
+            "norm_value": "Nayaka",
+            "evidence_quote": "Nayaka",
+            "quote_found": True,
+        },
+        {
+            "field": "deity",
+            "raw_value": "Kondathu Kaliamman",
+            "norm_value": "Kondathu Kaliamman",
+            "evidence_quote": "Goddess Kondathu Kaliamman",
+            "quote_found": True,
+        },
+    ]
+
+    new_site_id = None
+    try:
+        res = client.post(f"/api/chat/sessions/{session_id}/messages", json={
+            "content": "pariyur amman temple pathi sollu"
+        })
+        assert res.status_code == 200, res.text
+        data = res.json()
+        asst = data["assistant_message"]
+
+        assert asst["path"] == "web_consensus"
+        assert len(asst["citations"]) > 0
+        new_site_id = asst["citations"][0]["site_id"]
+        assert new_site_id.startswith("TN-ERD-")
+        assert asst["citations"][0]["origin"] == "web_consensus"
+        assert asst["citations"][0]["trust"] in ("official", "multi_source")
+
+        # Verify query_logs path_detail
+        with SessionLocal() as db:
+            log_row = db.execute(
+                sa_text("SELECT path, path_detail, gemini_calls FROM query_logs WHERE message_id = :mid"),
+                {"mid": data["user_message"]["message_id"]},
+            ).mappings().fetchone()
+            assert log_row is not None
+            assert log_row["path"] == "web_consensus"
+            assert log_row["path_detail"] is not None
+            assert "augment_job_id" in log_row["path_detail"]
+    finally:
+        if new_site_id:
+            from app.db.qdrant import get_qdrant_client
+            from app.core.config import settings
+            from qdrant_client.http import models
+            qdrant = get_qdrant_client()
+            qdrant.delete(
+                collection_name=settings.QDRANT_COLLECTION,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(must=[models.FieldCondition(key="site_id", match=models.MatchValue(value=new_site_id))])
+                ),
+            )
+            with SessionLocal() as db:
+                cids = [r[0] for r in db.execute(sa_text("SELECT chunk_id FROM chunk_registry WHERE site_id = :sid"), {"sid": new_site_id}).fetchall()]
+                if cids:
+                    db.execute(sa_text("DELETE FROM message_citations WHERE chunk_id = ANY(:cids)"), {"cids": cids})
+                db.execute(sa_text("UPDATE chat_messages SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": new_site_id})
+                db.execute(sa_text("UPDATE query_logs SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": new_site_id})
+                db.execute(sa_text("DELETE FROM augment_jobs WHERE site_id = :sid"), {"sid": new_site_id})
+                db.execute(sa_text("DELETE FROM sites WHERE site_id = :sid"), {"sid": new_site_id})
+                db.commit()
 
 
 def test_identity_check_bannari_accepted():

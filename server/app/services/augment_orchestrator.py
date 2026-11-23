@@ -416,7 +416,7 @@ def run_augmentation_pipeline(
             dec = evaluate_field_consensus(f_name, f_claims)
             decisions[f_name] = dec
 
-        # Inject entity_name and district_id into decisions if supported by query/classification
+        # Inject entity_name if supported by query/classification
         if decisions.get("name_en") is None or decisions["name_en"].decision != "verified":
             decisions["name_en"] = FieldDecisionResult(
                 field="name_en",
@@ -427,16 +427,36 @@ def run_augmentation_pipeline(
                 has_tier_a=False,
                 rule_fired="verified_user_entity_anchor",
             )
-        if district_id and (decisions.get("district_id") is None or decisions["district_id"].decision != "verified"):
-            decisions["district_id"] = FieldDecisionResult(
-                field="district_id",
-                decision="verified",
-                value=str(district_id),
-                support=2.0,
-                n_clusters=2,
-                has_tier_a=False,
-                rule_fired="verified_district_resolution",
-            )
+
+        # Resolve district_id from decisions, classification, or place_name
+        if decisions.get("district_id") is None or decisions["district_id"].decision != "verified":
+            dist_val = None
+            if decisions.get("district") and decisions["district"].value:
+                dist_val = decisions["district"].value
+            elif district_id:
+                dist_val = str(district_id)
+            elif place_name:
+                dist_val = place_name
+
+            if dist_val:
+                dist_row = db.execute(
+                    sa_text("""
+                        SELECT location_id FROM locations
+                        WHERE level = 'district'
+                          AND (lower(name_en) = lower(:p) OR lower(name_ta) = lower(:p) OR location_id::text = :p)
+                    """),
+                    {"p": str(dist_val).strip()},
+                ).fetchone()
+                if dist_row:
+                    decisions["district_id"] = FieldDecisionResult(
+                        field="district_id",
+                        decision="verified",
+                        value=str(dist_row[0]),
+                        support=2.0,
+                        n_clusters=2,
+                        has_tier_a=False,
+                        rule_fired="verified_district_resolution",
+                    )
 
         # 8. Write-back Gating & Execution
         allocated_site_id = execute_writeback(

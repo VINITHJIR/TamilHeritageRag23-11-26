@@ -12,6 +12,7 @@ Implements the multi-step retrieval-augmented conversational pipeline:
 9. Request idempotency using client idempotency_key or recent duplicate guard.
 """
 
+import json
 import logging
 import re
 import time
@@ -28,7 +29,9 @@ from app.schemas.chat import (
     CitationItem,
     UserMessagePayload,
 )
+from app.services.augment_orchestrator import run_augmentation_pipeline
 from app.services.embeddings import get_embedding_service
+from app.services.gemini import synthesize_answer as gemini_synthesize_answer
 
 logger = logging.getLogger(__name__)
 
@@ -577,14 +580,112 @@ def process_chat_message(
                 f"Identity check rejected candidate '{candidate_site}' for query '{clean_content}': {identity_reason} (sim={id_sim:.3f})"
             )
 
-    # 6. Determine path and extractive answer
-    # Threshold: top_score < 0.45 or out_of_scope or identity mismatch -> rejected
-    if q_type == "out_of_scope" or top_score < 0.45 or not ranked_chunks or not identity_valid:
+    path_detail: Optional[Dict[str, Any]] = None
+    gemini_calls_count = 0
+
+    # 6. Determine path and extractive / synthesized answer
+    # Initial check: top_score < 0.45 or identity mismatch or no initial hits
+    needs_augmentation = (q_type != "out_of_scope") and (top_score < 0.45 or not ranked_chunks or not identity_valid)
+
+    if needs_augmentation:
+        extracted_entity = extract_entity_name(clean_content)
+        if extracted_entity:
+            logger.info(f"Triggering IC3-WB self-augmentation for entity candidate: '{extracted_entity}'")
+            try:
+                aug_res = run_augmentation_pipeline(
+                    query=clean_content,
+                    message_id=None,
+                    lang=detected_lang,
+                    db=db,
+                )
+                gemini_calls_count += aug_res.gemini_calls
+                path_detail = {
+                    "augment_job_id": str(aug_res.job_id),
+                    "candidate_key": aug_res.candidate_key,
+                    "status": aug_res.status,
+                    "decision_reason": aug_res.decision_reason,
+                }
+
+                if aug_res.status == "verified" and aug_res.site_id:
+                    # Re-run Qdrant retrieval for this query (it will now find the newly written chunks!)
+                    new_ranked = search_and_rank_chunks(
+                        query_text=clean_content,
+                        query_lang=detected_lang,
+                        resolved_site=aug_res.site_id,
+                        detected_district=detected_district,
+                        top_k=8,
+                    )
+                    if new_ranked:
+                        ranked_chunks = new_ranked
+                        top_score = ranked_chunks[0]["raw_score"]
+                        path = "web_consensus"
+                        effective_resolved_site = aug_res.site_id
+
+                        # Select best 1-2 chunks
+                        selected_chunks = [ranked_chunks[0]]
+                        if len(ranked_chunks) > 1 and ranked_chunks[1]["site_id"] == aug_res.site_id:
+                            selected_chunks.append(ranked_chunks[1])
+
+                        citations = []
+                        used_chunk_ids = []
+                        for rank, chunk in enumerate(selected_chunks, start=1):
+                            cit = CitationItem(
+                                chunk_id=chunk["chunk_id"],
+                                site_id=chunk["site_id"],
+                                site_name_en=chunk["site_name_en"],
+                                site_name_ta=chunk["site_name_ta"],
+                                section=chunk["section"],
+                                lang=chunk["lang"],
+                                score=chunk["raw_score"],
+                                trust=chunk["trust"],
+                                origin=chunk["origin"],
+                                source_url=None,
+                            )
+                            citations.append(cit)
+                            used_chunk_ids.append(chunk["chunk_id"])
+
+                        # Synthesize answer using Gemini + newly verified chunks
+                        facts_for_synth = [
+                            {"field": c["section"], "value": c["text"], "source_url": c["origin"]}
+                            for c in selected_chunks
+                        ]
+                        assistant_content = gemini_synthesize_answer(clean_content, facts_for_synth, lang=detected_lang)
+                        gemini_calls_count += 1
+                    else:
+                        path = "rejected"
+                        assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+                        selected_chunks = []
+                        citations = []
+                        used_chunk_ids = []
+                        effective_resolved_site = None
+                else:
+                    path = "rejected"
+                    assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+                    selected_chunks = []
+                    citations = []
+                    used_chunk_ids = []
+                    effective_resolved_site = None
+            except Exception as e:
+                logger.error(f"Error during on-demand self-augmentation: {e}", exc_info=True)
+                path = "rejected"
+                assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+                selected_chunks = []
+                citations = []
+                used_chunk_ids = []
+                effective_resolved_site = None
+        else:
+            path = "rejected"
+            assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+            selected_chunks = []
+            citations = []
+            used_chunk_ids = []
+            effective_resolved_site = None
+    elif q_type == "out_of_scope" or not ranked_chunks:
         path = "rejected"
         assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
         selected_chunks = []
-        citations: List[CitationItem] = []
-        used_chunk_ids: List[str] = []
+        citations = []
+        used_chunk_ids = []
         effective_resolved_site = None
     else:
         path = "db"
@@ -685,10 +786,10 @@ def process_chat_message(
     log_stmt = sa_text("""
         INSERT INTO query_logs (
             message_id, query_text, query_lang, rewritten_en, resolved_site,
-            path, top_score, chunk_ids, latency_ms, created_at
+            path, top_score, chunk_ids, latency_ms, path_detail, gemini_calls, created_at
         ) VALUES (
             :message_id, :query_text, :query_lang, NULL, :resolved_site,
-            :path, :top_score, :chunk_ids, :latency_ms, now()
+            :path, :top_score, :chunk_ids, :latency_ms, CAST(:path_detail AS jsonb), :gemini_calls, now()
         )
     """)
     db.execute(log_stmt, {
@@ -700,6 +801,8 @@ def process_chat_message(
         "top_score": top_score,
         "chunk_ids": [uuid.UUID(cid) for cid in used_chunk_ids] if used_chunk_ids else None,
         "latency_ms": latency_ms,
+        "path_detail": json.dumps(path_detail) if path_detail else None,
+        "gemini_calls": gemini_calls_count,
     })
 
     # 7e. Session title
