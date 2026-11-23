@@ -587,3 +587,36 @@ def test_message_idempotency():
         assert user_msgs == 1
         assert asst_msgs == 1
 
+
+def test_conversational_greeting():
+    """Verify that conversational greetings like 'hi', 'vanakkam', 'வணக்கம்' return welcoming heritage prompt."""
+    guest_res = client.post("/api/users/guest")
+    user_id = guest_res.json()["user_id"]
+    session_id = client.post("/api/chat/sessions", json={"user_id": user_id}).json()["session_id"]
+
+    # 1. English greeting "hi"
+    res_en = client.post(f"/api/chat/sessions/{session_id}/messages", json={"content": "hi"})
+    assert res_en.status_code == 200, res_en.text
+    data_en = res_en.json()["assistant_message"]
+    assert data_en["path"] == "greeting"
+    assert data_en["citations"] == []
+    assert "How can I help you today" in data_en["content"]
+    assert "heritage" in data_en["content"].lower()
+
+    # 2. Tamil greeting "வணக்கம்"
+    res_ta = client.post(f"/api/chat/sessions/{session_id}/messages", json={"content": "வணக்கம்"})
+    assert res_ta.status_code == 200, res_ta.text
+    data_ta = res_ta.json()["assistant_message"]
+    assert data_ta["path"] == "greeting"
+    assert data_ta["citations"] == []
+    assert "வணக்கம்" in data_ta["content"]
+
+    # 3. Tanglish greeting "vanakkam"
+    res_tgl = client.post(f"/api/chat/sessions/{session_id}/messages", json={"content": "vanakkam"})
+    assert res_tgl.status_code == 200, res_tgl.text
+    data_tgl = res_tgl.json()["assistant_message"]
+    assert data_tgl["path"] == "greeting"
+    assert data_tgl["citations"] == []
+    assert "Vanakkam" in data_tgl["content"]
+
+

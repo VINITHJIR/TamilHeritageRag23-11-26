@@ -47,7 +47,7 @@ TAMIL_SCRIPT_RE = re.compile(r"[\u0B80-\u0BFF]")
 KANNADA_SCRIPT_RE = re.compile(r"[\u0C80-\u0CFF]")
 
 TANGLISH_MARKERS = {
-    "kovil", "koyil", "kovilla", "koyilla", "kovilku", "koviloda", "kovil-la", "kovil-ku", "kovil-oda",
+    "vanakkam", "kovil", "koyil", "kovilla", "koyilla", "kovilku", "koviloda", "kovil-la", "kovil-ku", "kovil-oda",
     "templela", "temple-la", "templeoda", "temple-oda", "templeku", "temple-ku",
     "enna", "yaaru", "yaar", "yaarukku", "enga", "engae", "engirukku", "eppadi", "epdi",
     "nadakkum", "irukku", "iruku", "irukkum", "kattiyavar", "kattinaar", "kattinaanga", "kattina",
@@ -356,6 +356,44 @@ REJECTION_MESSAGES = {
     "en": "I could not find reliable records for this heritage query in our database.",
 }
 
+# -----------------------------------------------------------------------------
+# Conversational Greetings & Welcome Responses
+# -----------------------------------------------------------------------------
+GREETING_WORDS = {
+    "hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon",
+    "good evening", "good day", "hi there", "hello there", "hey there",
+    "vanakkam", "வணக்கம்", "namaskara", "namaste", "namaskaram",
+    "hi bot", "hello bot", "hi llm", "hello llm",
+}
+
+GREETING_RESPONSES = {
+    "en": "Hello! How can I help you today with Tamil Nadu's heritage sites, temples, monuments, and history?",
+    "ta": "வணக்கம்! தமிழ்நாட்டின் வரலாற்றுச் சின்னங்கள், கோயில்கள், கோட்டைகள் மற்றும் பாரம்பரியம் பற்றி இன்று உங்களுக்கு எவ்வாறு உதவ முடியும்?",
+    "ta-Latn": "Vanakkam! Tamil Nadu heritage sites, kovilgal, monuments matrum varalaaru pathi inniku ungalukku eppadi help panna mudiyum?",
+    "kn": "ನಮಸ್ಕಾರ! ತಮಿಳುನಾಡಿನ ಐತಿಹಾಸಿಕ ತಾಣಗಳು, ದೇವಾಲಯಗಳು ಮತ್ತು ಪರಂಪರೆಯ ಬಗ್ಗೆ ಇಂದು ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
+}
+
+
+GREETING_PUNCT_RE = re.compile(r"[\.,!\?;:\'\"\-]+")
+
+
+def is_greeting(text: str) -> bool:
+    """Check if the user input is a pure greeting rather than a specific factual query."""
+    clean = re.sub(r"\s+", " ", GREETING_PUNCT_RE.sub(" ", text)).strip().lower()
+    if not clean:
+        return False
+    if clean in GREETING_WORDS:
+        return True
+    tokens = clean.split()
+    if len(tokens) <= 3 and tokens[0] in {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "namaskara", "namaste"}:
+        heritage_clues = {
+            "who", "what", "where", "when", "how", "temple", "kovil", "koyil",
+            "kattiyavar", "enga", "eppo", "history", "varalaaru", "festival", "timings"
+        }
+        if not any(w in clean for w in heritage_clues):
+            return True
+    return False
+
 
 def search_and_rank_chunks(
     query_text: str,
@@ -548,6 +586,97 @@ def process_chat_message(
 
     # 1. Language detection
     detected_lang = detect_language(clean_content)
+
+    # 1b. Conversational Greeting Handler
+    if is_greeting(clean_content):
+        latency_ms = int((time.time() - start_time) * 1000)
+        assistant_content = GREETING_RESPONSES.get(detected_lang, GREETING_RESPONSES["en"])
+
+        # Persist greeting turn
+        u_row = db.execute(sa_text("""
+            INSERT INTO chat_messages (
+                session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+            ) VALUES (
+                :session_id, 'user', :content, :lang, 'general_heritage', NULL, NULL, now()
+            ) RETURNING message_id, created_at
+        """), {
+            "session_id": session_id,
+            "content": clean_content,
+            "lang": detected_lang,
+        }).mappings().fetchone()
+        user_message_id = u_row["message_id"]
+        user_created_at = u_row["created_at"]
+
+        a_row = db.execute(sa_text("""
+            INSERT INTO chat_messages (
+                session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+            ) VALUES (
+                :session_id, 'assistant', :content, :lang, NULL, NULL, :reply_to, now()
+            ) RETURNING message_id, created_at
+        """), {
+            "session_id": session_id,
+            "content": assistant_content,
+            "lang": detected_lang,
+            "reply_to": user_message_id,
+        }).mappings().fetchone()
+        assistant_message_id = a_row["message_id"]
+        assistant_created_at = a_row["created_at"]
+
+        db.execute(sa_text("""
+            INSERT INTO query_logs (
+                message_id, query_text, query_lang, rewritten_en, resolved_site,
+                path, top_score, chunk_ids, latency_ms, path_detail, gemini_calls, created_at
+            ) VALUES (
+                :message_id, :query_text, :query_lang, NULL, NULL,
+                'greeting', 1.0, NULL, :latency_ms, NULL, 0, now()
+            )
+        """), {
+            "message_id": user_message_id,
+            "query_text": clean_content,
+            "query_lang": detected_lang,
+            "latency_ms": latency_ms,
+        })
+
+        db.execute(sa_text("""
+            UPDATE chat_sessions
+            SET last_message_at = now(),
+                title = CASE WHEN (title IS NULL OR title = 'New Chat') THEN :title ELSE title END
+            WHERE session_id = :sid
+        """), {
+            "sid": session_id,
+            "title": clean_content[:50],
+        })
+        db.commit()
+
+        user_payload = UserMessagePayload(
+            message_id=user_message_id,
+            session_id=session_id,
+            role="user",
+            content=clean_content,
+            lang=detected_lang,
+            question_type="general_heritage",
+            resolved_site=None,
+            created_at=user_created_at,
+        )
+        asst_payload = AssistantMessagePayload(
+            message_id=assistant_message_id,
+            session_id=session_id,
+            role="assistant",
+            content=assistant_content,
+            lang=detected_lang,
+            path="greeting",
+            top_score=1.0,
+            latency_ms=latency_ms,
+            question_type="general_heritage",
+            resolved_site=None,
+            reply_to=user_message_id,
+            created_at=assistant_created_at,
+            citations=[],
+        )
+        resp = ChatMessageResponse(user_message=user_payload, assistant_message=asst_payload)
+        if idempotency_key:
+            _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
+        return resp
 
     # 2. Question type classification
     q_type = classify_question_type(clean_content)

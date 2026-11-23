@@ -278,6 +278,8 @@ export default function ChatPage() {
                   </div>
                 )}
 
+                {/* Spacer ensuring comfortable gap between upper chat history and input box */}
+                <div className="chat-messages-bottom-spacer" />
                 <div ref={messagesEndRef} />
               </>
             )}

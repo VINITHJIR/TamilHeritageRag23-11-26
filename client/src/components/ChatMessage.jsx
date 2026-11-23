@@ -137,6 +137,7 @@ export default function ChatMessage({ message, onFeedback }) {
     rejected: { label: 'No reliable info', className: 'badge-path-rejected' },
     web_pending: { label: 'Checking sources…', className: 'badge-path-pending' },
     web_consensus: { label: 'Verified from web', className: 'badge-path-web' },
+    greeting: { label: 'Assistant', className: 'badge-path-greeting' },
   };
 
   const langInfo = langBadges[message.lang] || { label: message.lang || 'English', className: 'badge-lang-en' };

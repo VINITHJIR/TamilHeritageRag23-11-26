@@ -415,6 +415,12 @@ a:hover {
   gap: 1.5rem;
 }
 
+.chat-messages-bottom-spacer {
+  height: 7.5rem;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
 .chat-message-row {
   display: flex;
   width: 100%;
@@ -535,6 +541,7 @@ a:hover {
 .badge-path-rejected { background-color: #f1f5f9; color: #475569; }
 .badge-path-pending { background-color: #e0f2fe; color: #0284c7; }
 .badge-path-web { background-color: #ccfbf1; color: #0f766e; }
+.badge-path-greeting { background-color: #fef3c7; color: #92400e; }
 
 .badge-section { background-color: #fef3c7; color: #92400e; }
 .badge-origin { background-color: #f1f5f9; color: #475569; }
