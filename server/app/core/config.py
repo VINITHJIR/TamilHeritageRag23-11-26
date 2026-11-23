@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     EMBED_MODEL: str = "BAAI/bge-m3"
     EMBED_DEVICE: str = "auto"  # 'auto' selects cuda if available else cpu
 
+    # Google Gemini LLM Settings
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SEC: float = 30.0
+
     # CORS Origins
     CORS_ORIGINS: List[str] = ["http://localhost:5173"]
 

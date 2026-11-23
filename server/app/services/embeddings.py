@@ -85,6 +85,10 @@ class EmbeddingService:
         )
         return embedding.tolist()
 
+    def embed_text(self, text: str) -> List[float]:
+        """Compute normalized dense embedding for a single text chunk."""
+        return self.embed_query(text)
+
     @staticmethod
     def format_chunk_for_embedding(name_en: str, name_ta: Optional[str], section: str, text: str) -> str:
         """Format chunk text according to project specification:
