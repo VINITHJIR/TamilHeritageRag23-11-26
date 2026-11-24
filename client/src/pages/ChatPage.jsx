@@ -21,7 +21,17 @@ export default function ChatPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
-  const [userId, setUserId] = useState(null);
+  // 0. Synchronous initialization of guest user and sessions cache
+  const SESSIONS_CACHE_KEY = 'tamilheritage_cached_sessions';
+
+  const [userId, setUserId] = useState(() => {
+    try {
+      return localStorage.getItem('tamilheritage_guest_user_id') || null;
+    } catch {
+      return null;
+    }
+  });
+
   const [inputText, setInputText] = useState('');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -33,7 +43,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef(null);
   const scrollContainerRef = useRef(null);
 
-  // 1. Initialize guest user on mount
+  // 1. Initialize guest user on mount if not in localStorage
   useEffect(() => {
     async function initUser() {
       try {
@@ -43,14 +53,43 @@ export default function ChatPage() {
         console.error('Failed to init guest user:', err);
       }
     }
-    initUser();
-  }, []);
+    if (!userId) {
+      initUser();
+    }
+  }, [userId]);
 
-  // 2. Fetch Sessions for sidebar
-  const { data: sessions = [], refetch: refetchSessions } = useQuery({
+  // 2. Fetch Sessions for sidebar with instantaneous initialData from localStorage
+  const {
+    data: sessions = [],
+    isLoading: sessionsLoading,
+    refetch: refetchSessions,
+  } = useQuery({
     queryKey: ['sessions', userId],
-    queryFn: () => fetchSessions(userId),
+    queryFn: async () => {
+      const data = await fetchSessions(userId);
+      try {
+        localStorage.setItem(SESSIONS_CACHE_KEY, JSON.stringify(data));
+      } catch (e) {
+        // ignore quota error
+      }
+      return data;
+    },
+    initialData: () => {
+      try {
+        const cached = localStorage.getItem(SESSIONS_CACHE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return parsed;
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return undefined;
+    },
     enabled: !!userId,
+    staleTime: 1000 * 30, // 30s fresh cache
   });
 
   // 3. Fetch Messages for active session
@@ -162,6 +201,9 @@ export default function ChatPage() {
   const handleRenameSession = async (sId, newTitle) => {
     try {
       await updateSession(sId, { title: newTitle });
+      queryClient.setQueryData(['sessions', userId], (old = []) =>
+        old.map((s) => (s.session_id === sId ? { ...s, title: newTitle } : s))
+      );
       queryClient.invalidateQueries({ queryKey: ['sessions', userId] });
     } catch (err) {
       console.error('Rename failed:', err);
@@ -171,6 +213,9 @@ export default function ChatPage() {
   const handleArchiveSession = async (sId) => {
     try {
       await updateSession(sId, { is_archived: true });
+      queryClient.setQueryData(['sessions', userId], (old = []) =>
+        old.filter((s) => s.session_id !== sId)
+      );
       queryClient.invalidateQueries({ queryKey: ['sessions', userId] });
       if (sessionId === sId) {
         navigate('/');
@@ -197,6 +242,7 @@ export default function ChatPage() {
       {/* Sidebar */}
       <ChatSidebar
         sessions={sessions}
+        isLoading={sessionsLoading && sessions.length === 0}
         onNewChat={handleNewChat}
         onRenameSession={handleRenameSession}
         onArchiveSession={handleArchiveSession}
@@ -237,6 +283,23 @@ export default function ChatPage() {
             {/* Empty state when on "/" with no messages */}
             {!sessionId && messages.length === 0 ? (
               <EmptyState onSelectExample={(query) => handleSend(query)} />
+            ) : messagesLoading && messages.length === 0 ? (
+              <div className="chat-messages-skeleton-container" aria-label="Loading conversation history">
+                <div className="chat-message-row chat-user-row">
+                  <div className="chat-skeleton-bubble user shimmer" style={{ width: '40%', height: '38px', marginLeft: 'auto' }} />
+                </div>
+                <div className="chat-message-row chat-assistant-row">
+                  <div className="chat-avatar" aria-hidden="true">🏛️</div>
+                  <div className="chat-skeleton-bubble assistant shimmer" style={{ width: '85%', height: '88px' }} />
+                </div>
+                <div className="chat-message-row chat-user-row">
+                  <div className="chat-skeleton-bubble user shimmer" style={{ width: '55%', height: '38px', marginLeft: 'auto' }} />
+                </div>
+                <div className="chat-message-row chat-assistant-row">
+                  <div className="chat-avatar" aria-hidden="true">🏛️</div>
+                  <div className="chat-skeleton-bubble assistant shimmer" style={{ width: '75%', height: '110px' }} />
+                </div>
+              </div>
             ) : (
               <>
                 {messages.map((msg, idx) => (

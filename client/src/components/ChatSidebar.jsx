@@ -36,6 +36,7 @@ function groupSessionsByDate(sessions = []) {
 
 export default function ChatSidebar({
   sessions = [],
+  isLoading = false,
   onNewChat,
   onRenameSession,
   onArchiveSession,
@@ -193,29 +194,47 @@ export default function ChatSidebar({
 
       {/* Session Lists grouped */}
       <div className="sidebar-sessions-list">
-        {today.length > 0 && (
-          <div className="sidebar-group">
-            <div className="sidebar-group-title">Today</div>
-            {today.map(renderSessionItem)}
+        {isLoading && sessions.length === 0 ? (
+          <div className="sidebar-skeleton-list" aria-label="Loading chat history">
+            <div className="sidebar-group">
+              <div className="sidebar-skeleton-title shimmer" />
+              <div className="sidebar-skeleton-item shimmer" style={{ width: '85%' }} />
+              <div className="sidebar-skeleton-item shimmer" style={{ width: '70%' }} />
+              <div className="sidebar-skeleton-item shimmer" style={{ width: '92%' }} />
+            </div>
+            <div className="sidebar-group">
+              <div className="sidebar-skeleton-title shimmer" />
+              <div className="sidebar-skeleton-item shimmer" style={{ width: '65%' }} />
+              <div className="sidebar-skeleton-item shimmer" style={{ width: '80%' }} />
+            </div>
           </div>
-        )}
+        ) : (
+          <>
+            {today.length > 0 && (
+              <div className="sidebar-group">
+                <div className="sidebar-group-title">Today</div>
+                {today.map(renderSessionItem)}
+              </div>
+            )}
 
-        {prev7Days.length > 0 && (
-          <div className="sidebar-group">
-            <div className="sidebar-group-title">Previous 7 days</div>
-            {prev7Days.map(renderSessionItem)}
-          </div>
-        )}
+            {prev7Days.length > 0 && (
+              <div className="sidebar-group">
+                <div className="sidebar-group-title">Previous 7 days</div>
+                {prev7Days.map(renderSessionItem)}
+              </div>
+            )}
 
-        {older.length > 0 && (
-          <div className="sidebar-group">
-            <div className="sidebar-group-title">Older</div>
-            {older.map(renderSessionItem)}
-          </div>
-        )}
+            {older.length > 0 && (
+              <div className="sidebar-group">
+                <div className="sidebar-group-title">Older</div>
+                {older.map(renderSessionItem)}
+              </div>
+            )}
 
-        {sessions.length === 0 && (
-          <div className="sidebar-empty-hint">No chats yet</div>
+            {sessions.length === 0 && (
+              <div className="sidebar-empty-hint">No chats yet</div>
+            )}
+          </>
         )}
       </div>
 
