@@ -183,3 +183,28 @@ export async function reindexChunks() {
   if (!res.ok) throw new Error('Reindexing request failed');
   return res.json();
 }
+
+// -------------------------------------------------------------------------
+// Clarification Flow
+// -------------------------------------------------------------------------
+export async function fetchOpenClarification(sessionId) {
+  const res = await fetch(`${API_BASE}/clarifications/open?session_id=${encodeURIComponent(sessionId)}`);
+  if (!res.ok) throw new Error(`Failed to fetch clarification (HTTP ${res.status})`);
+  return res.json(); // {status, clarification_id, candidates, question_type} or {status:'none'}
+}
+
+export async function respondToClarification({ sessionId, clarificationId, optionId, text }) {
+  const body = { session_id: sessionId };
+  if (optionId) body.option_id = optionId;
+  if (text) body.text = text;
+  const res = await fetch(`${API_BASE}/clarifications/respond`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Clarification respond failed (HTTP ${res.status})`);
+  }
+  return res.json();
+}

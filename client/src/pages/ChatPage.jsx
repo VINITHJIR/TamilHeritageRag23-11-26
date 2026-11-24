@@ -4,9 +4,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDown, Menu, RefreshCw } from 'lucide-react';
 import {
   createSession,
+  fetchOpenClarification,
   fetchSessionMessages,
   fetchSessions,
   getOrCreateGuestUserId,
+  respondToClarification,
   sendMessage,
   submitFeedback,
   updateSession,
@@ -14,6 +16,7 @@ import {
 import ChatSidebar from '../components/ChatSidebar';
 import ChatMessage from '../components/ChatMessage';
 import ChatInput from '../components/ChatInput';
+import ClarificationPrompt from '../components/ClarificationPrompt';
 import EmptyState from '../components/EmptyState';
 
 export default function ChatPage() {
@@ -39,6 +42,12 @@ export default function ChatPage() {
   const [lastFailedText, setLastFailedText] = useState(null);
   const [optimisticUserMsg, setOptimisticUserMsg] = useState(null);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
+
+  // Clarification state
+  const [activeClarification, setActiveClarification] = useState(null);
+  // {clarification_id, entity_name, candidates:[{option_id, label, locality, district, site_id}]}
+  const [clarificationBusy, setClarificationBusy] = useState(false);
+  const [clarificationStepLabel, setClarificationStepLabel] = useState('');
 
   const messagesEndRef = useRef(null);
   const scrollContainerRef = useRef(null);
@@ -139,6 +148,8 @@ export default function ChatPage() {
     setSendError(null);
     setLastFailedText(null);
     setIsSending(true);
+    // Clear any active clarification when user sends a new message
+    setActiveClarification(null);
 
     // Optimistic message
     const tempMsg = {
@@ -179,6 +190,20 @@ export default function ChatPage() {
       } else {
         await queryClient.invalidateQueries({ queryKey: ['messages', targetSessionId] });
         queryClient.invalidateQueries({ queryKey: ['sessions', userId] });
+
+        // Check if the backend opened a clarification for this session
+        try {
+          const clar = await fetchOpenClarification(targetSessionId);
+          if (clar.status === 'open' && clar.candidates?.length > 0) {
+            setActiveClarification({
+              clarification_id: clar.clarification_id,
+              entity_name: content,
+              candidates: clar.candidates,
+            });
+          }
+        } catch (_) {
+          // non-fatal
+        }
       }
     } catch (err) {
       console.error('Send message failed:', err);
@@ -186,6 +211,59 @@ export default function ChatPage() {
       setLastFailedText(content);
     } finally {
       setIsSending(false);
+      setOptimisticUserMsg(null);
+    }
+  };
+
+  // Chip or free-text clarification handlers
+  const handleChipSelect = async (clarificationId, optionId, label) => {
+    if (!sessionId) return;
+    setClarificationBusy(true);
+    setClarificationStepLabel(`Checking sources for ${label}…`);
+    // Show the chip label as a user message optimistically
+    setOptimisticUserMsg({
+      message_id: Date.now(),
+      role: 'user',
+      content: label,
+      created_at: new Date().toISOString(),
+    });
+    try {
+      await respondToClarification({ sessionId, clarificationId, optionId });
+      // After backend resolves, send the enriched query as a message
+      setActiveClarification(null);
+      await sendMessage(sessionId, label);
+      await queryClient.invalidateQueries({ queryKey: ['messages', sessionId] });
+      queryClient.invalidateQueries({ queryKey: ['sessions', userId] });
+    } catch (err) {
+      setSendError(err.message || 'Failed to resolve clarification.');
+    } finally {
+      setClarificationBusy(false);
+      setClarificationStepLabel('');
+      setOptimisticUserMsg(null);
+    }
+  };
+
+  const handleClarificationText = async (text) => {
+    if (!sessionId || !activeClarification) return;
+    setClarificationBusy(true);
+    setClarificationStepLabel(`Searching for ${text}…`);
+    setOptimisticUserMsg({
+      message_id: Date.now(),
+      role: 'user',
+      content: text,
+      created_at: new Date().toISOString(),
+    });
+    try {
+      await respondToClarification({ sessionId, clarificationId: activeClarification.clarification_id, text });
+      setActiveClarification(null);
+      await sendMessage(sessionId, text);
+      await queryClient.invalidateQueries({ queryKey: ['messages', sessionId] });
+      queryClient.invalidateQueries({ queryKey: ['sessions', userId] });
+    } catch (err) {
+      setSendError(err.message || 'Failed to resolve clarification.');
+    } finally {
+      setClarificationBusy(false);
+      setClarificationStepLabel('');
       setOptimisticUserMsg(null);
     }
   };
@@ -309,6 +387,22 @@ export default function ChatPage() {
                     onFeedback={handleFeedback}
                   />
                 ))}
+
+                {/* Clarification prompt – shown when backend asks user to pick a location */}
+                {activeClarification && !isSending && (
+                  <div className="chat-message-row chat-assistant-row">
+                    <div className="chat-avatar" aria-hidden="true">🏛️</div>
+                    <ClarificationPrompt
+                      clarificationId={activeClarification.clarification_id}
+                      entityName={activeClarification.entity_name}
+                      options={activeClarification.candidates}
+                      onChipSelect={handleChipSelect}
+                      onTextSubmit={handleClarificationText}
+                      isBusy={clarificationBusy}
+                      stepLabel={clarificationStepLabel}
+                    />
+                  </div>
+                )}
 
                 {/* Typing indicator */}
                 {isSending && (

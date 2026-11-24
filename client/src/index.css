@@ -1295,3 +1295,163 @@ tr:hover td {
 /* Typography */
 .text-ta { font-family: 'Noto Sans Tamil', var(--font-family); }
 .text-kn { font-family: 'Noto Sans Kannada', var(--font-family); }
+
+
+/* ============================================================
+   Clarification Prompt — chips, stepper, free-text
+   ============================================================ */
+
+.clarification-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 520px;
+  background: var(--bg-secondary, #fff8f2);
+  border: 1px solid var(--border-color, #e8d5c0);
+  border-radius: 14px;
+  padding: 14px 16px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.clarification-question {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  color: var(--text-primary, #2d1a08);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.clarification-question-icon {
+  color: var(--accent, #8B4513);
+  flex-shrink: 0;
+}
+
+/* Chips container */
+.clarification-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Individual chip */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 13px;
+  border: 1.5px solid var(--accent, #8B4513);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent, #8B4513);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, transform 0.1s;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  background: var(--accent, #8B4513);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.chip:active {
+  transform: translateY(0);
+}
+
+.chip--verified {
+  border-color: var(--success, #2e7d32);
+  color: var(--success, #2e7d32);
+}
+
+.chip--verified:hover {
+  background: var(--success, #2e7d32);
+  color: #fff;
+}
+
+.chip-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: currentColor;
+  border-radius: 50%;
+  width: 15px;
+  height: 15px;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.chip-badge svg {
+  color: #fff;
+}
+
+/* Free-text fallback */
+.clarification-hint {
+  font-size: 0.78rem;
+  color: var(--text-muted, #888);
+}
+
+.clarification-freetext {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.clarification-freetext-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.clarification-input {
+  flex: 1;
+  padding: 7px 12px;
+  border: 1.5px solid var(--border-color, #e8d5c0);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #2d1a08);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.clarification-input:focus {
+  border-color: var(--accent, #8B4513);
+}
+
+.clarification-submit {
+  padding: 7px 14px;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+/* Stepper (shown while resolving) */
+.clarification-stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  color: var(--text-muted, #888);
+  font-size: 0.85rem;
+}
+
+.clarification-stepper-icon {
+  color: var(--accent, #8B4513);
+  flex-shrink: 0;
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.clarification-stepper-label {
+  font-style: italic;
+}
