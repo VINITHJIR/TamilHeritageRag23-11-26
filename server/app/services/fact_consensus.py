@@ -116,6 +116,43 @@ def normalize_deity(raw: str) -> str:
     return raw.strip().title()
 
 
+CANONICAL_CATEGORIES = {
+    "temple": "temple",
+    "kovil": "temple",
+    "amman temple": "temple",
+    "hindu temple": "temple",
+    "shiva temple": "temple",
+    "vishnu temple": "temple",
+    "fort": "fort",
+    "kottai": "fort",
+    "palace": "palace",
+    "aranmanai": "palace",
+    "museum": "museum",
+    "monument": "monument",
+    "cave": "cave",
+    "rock cut": "rock_cut",
+    "rock-cut": "rock_cut",
+    "archaeological": "archaeological_site",
+    "megalithic": "megalithic_site",
+    "inscription": "inscription",
+    "memorial": "memorial",
+    "church": "church",
+    "mosque": "mosque",
+    "jain": "jain_site",
+}
+
+
+def normalize_category(raw: str) -> str:
+    """Normalize a raw category string to standard DB site category."""
+    if not raw:
+        return "temple"
+    clean = re.sub(r"[^\w\s]", "", raw.lower()).strip()
+    for k, v in CANONICAL_CATEGORIES.items():
+        if k in clean:
+            return v
+    return raw.strip().lower()
+
+
 def normalize_fact_value(field: str, raw: str) -> str:
     """Normalize value according to field semantics."""
     if not raw:
@@ -128,6 +165,8 @@ def normalize_fact_value(field: str, raw: str) -> str:
         return normalize_builder(raw)
     elif f in ("deity", "main_deity", "presiding_deity"):
         return normalize_deity(raw)
+    elif f in ("primary_category", "category"):
+        return normalize_category(raw)
     elif f in ("is_unesco", "protected"):
         val_lower = raw.lower().strip()
         return "true" if any(w in val_lower for w in ("true", "yes", "1", "unesco")) else "false"
@@ -266,8 +305,8 @@ def evaluate_field_consensus(
     ]
 
     # 3. Apply Decision Rules
-    # Rule 3: Conflict Check (if top-2 competing both have support >= 0.8)
-    if len(scored_values) > 1:
+    # Rule 3: Conflict Check (if top-2 competing both have support >= 0.8 for atomic fields)
+    if field_name not in ("overview", "history") and len(scored_values) > 1:
         second_val = scored_values[1]
         if top_val["support"] >= 0.8 and second_val["support"] >= 0.8:
             return FieldDecisionResult(
@@ -294,8 +333,8 @@ def evaluate_field_consensus(
             competing=competing_entries,
         )
 
-    # Rule 2: Multi-cluster consensus verified (>= 2 independent clusters + support >= 1.4)
-    if top_val["n_clusters"] >= 2 and top_val["support"] >= 1.4:
+    # Rule 2: Multi-cluster consensus verified (>= 2 independent clusters + support >= 1.2)
+    if top_val["n_clusters"] >= 2 and top_val["support"] >= 1.2:
         return FieldDecisionResult(
             field=field_name,
             decision="verified",

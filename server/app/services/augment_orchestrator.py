@@ -18,7 +18,7 @@ import logging
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 import uuid
 import httpx
 from sqlalchemy import text as sa_text
@@ -82,38 +82,106 @@ def strip_html_tags(html_content: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Default Web Searcher (Wikipedia OpenSearch + Known Heritage Endpoints)
+# Default Web Searcher (Multi-Source: DDGS + Wikipedia API + Wikidata)
 # -----------------------------------------------------------------------------
 def default_web_search(query: str, max_results: int = 8) -> List[str]:
-    """Retrieve candidate URLs via Wikipedia Search API and public heritage search endpoints.
+    """Retrieve candidate URLs via multi-source public heritage endpoints and search.
 
-    Strict budget: returns up to max_results URLs without requiring paid API keys.
+    Combines:
+    1. DuckDuckGo Search (ddgs) for government portals, news, and official sites.
+    2. Wikipedia Full-Text Search API for authoritative articles.
+    3. Wikidata Search API for structured identifiers, sitelinks, and official URLs.
+    4. Companion HRCE page generation for official Tamil Nadu temple portals.
     """
     candidate_urls: List[str] = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TamilHeritageBot/1.0"}
 
-    # 1. Wikipedia OpenSearch API
-    try:
-        wiki_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={quote_plus(query)}&limit=5&namespace=0&format=json"
-        with httpx.Client(timeout=4.0, headers={"User-Agent": "TamilHeritageGPT/1.0"}) as client:
-            resp = client.get(wiki_url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if len(data) >= 4 and isinstance(data[3], list):
-                    candidate_urls.extend(data[3])
-    except Exception as e:
-        logger.warning(f"Wikipedia search failed for '{query}': {e}")
+    # Clean query: strip excess punctuation and duplicate words
+    clean_q = re.sub(r"[\.,!\?;:\'\"\-]+", " ", query).strip()
+    words = clean_q.split()
+    seen_w = set()
+    deduped_words = []
+    for w in words:
+        wl = w.lower()
+        if wl not in seen_w:
+            seen_w.add(wl)
+            deduped_words.append(w)
+    base_query = " ".join(deduped_words)
 
-    # 2. Tamil Wikipedia OpenSearch API
+    # 1. DuckDuckGo Search
     try:
-        ta_wiki_url = f"https://ta.wikipedia.org/w/api.php?action=opensearch&search={quote_plus(query)}&limit=3&namespace=0&format=json"
-        with httpx.Client(timeout=4.0, headers={"User-Agent": "TamilHeritageGPT/1.0"}) as client:
-            resp = client.get(ta_wiki_url)
-            if resp.status_code == 200:
-                data = resp.json()
-                if len(data) >= 4 and isinstance(data[3], list):
-                    candidate_urls.extend(data[3])
+        from duckduckgo_search import DDGS
+        for q_try in [base_query, query]:
+            try:
+                for r in DDGS().text(q_try, max_results=5):
+                    u = r.get("href", "")
+                    if not u:
+                        continue
+                    # Skip search engines, social media, and known anti-bot poison domains
+                    bad_domains = [
+                        "google.", "bing.", "yahoo.", "duckduckgo.", "instagram.com",
+                        "facebook.com", "twitter.com", "x.com", "youtube.com",
+                        "zhihu.com", "sso.rajasthan", "epfindia.gov.in", "epfo."
+                    ]
+                    if not any(bad in u.lower() for bad in bad_domains):
+                        candidate_urls.append(u)
+                if len(candidate_urls) >= 2:
+                    break
+            except Exception:
+                pass
     except Exception as e:
-        logger.warning(f"Tamil Wikipedia search failed for '{query}': {e}")
+        logger.debug(f"DDGS search failed for '{query}': {e}")
+
+    # 2. Wikipedia Full-Text Search API
+    try:
+        wiki_api = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={quote_plus(base_query)}&format=json"
+        with httpx.Client(timeout=4.0, headers=headers) as client:
+            resp = client.get(wiki_api)
+            if resp.status_code == 200:
+                for item in resp.json().get("query", {}).get("search", [])[:3]:
+                    title = item.get("title", "")
+                    if title:
+                        u = f"https://en.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                        candidate_urls.append(u)
+    except Exception as e:
+        logger.debug(f"Wikipedia search failed for '{query}': {e}")
+
+    # 3. Wikidata Search API (sitelinks and P856 official websites)
+    try:
+        wd_api = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={quote_plus(base_query)}&language=en&format=json"
+        with httpx.Client(timeout=4.0, headers=headers) as client:
+            resp = client.get(wd_api)
+            if resp.status_code == 200:
+                for ent in resp.json().get("search", [])[:1]:
+                    qid = ent.get("id")
+                    if qid:
+                        entity_res = client.get(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json")
+                        if entity_res.status_code == 200:
+                            ent_data = entity_res.json().get("entities", {}).get(qid, {})
+                            sitelinks = ent_data.get("sitelinks", {})
+                            for lang_key in ["enwiki", "tawiki"]:
+                                if lang_key in sitelinks and sitelinks[lang_key].get("url"):
+                                    candidate_urls.append(sitelinks[lang_key]["url"])
+                            claims = ent_data.get("claims", {})
+                            if "P856" in claims:
+                                for snak in claims["P856"]:
+                                    val = snak.get("mainsnak", {}).get("datavalue", {}).get("value")
+                                    if val and str(val).startswith("http"):
+                                        candidate_urls.append(str(val))
+    except Exception as e:
+        logger.debug(f"Wikidata search failed for '{query}': {e}")
+
+    # 4. Expand companion HRCE pages if any hrce.tn.gov.in link with tid is found
+    extra_hrce = []
+    for u in candidate_urls:
+        if "hrce.tn.gov.in" in u and "tid=" in u:
+            m = re.search(r"tid=(\d+)", u)
+            if m:
+                tid = m.group(1)
+                extra_hrce.append(f"https://hrce.tn.gov.in/hrcehome/index_temple.php?tid={tid}")
+                extra_hrce.append(f"https://hrce.tn.gov.in/hrcehome/history.php?tid={tid}")
+                extra_hrce.append(f"https://hrce.tn.gov.in/hrcehome/festival.php?tid={tid}")
+    candidate_urls.extend(extra_hrce)
 
     # Deduplicate while preserving order
     seen = set()
@@ -128,7 +196,7 @@ def default_web_search(query: str, max_results: int = 8) -> List[str]:
     return unique_urls
 
 
-def fetch_page_content(url: str, timeout_sec: float = 5.0) -> Optional[Tuple[str, int, str]]:
+def fetch_page_content(url: str, timeout_sec: float = 7.0) -> Optional[Tuple[str, int, str]]:
     """Fetch URL and return (cleaned_text, http_status, final_url)."""
     try:
         with httpx.Client(
@@ -272,8 +340,13 @@ def run_augmentation_pipeline(
         )
         db.commit()
 
-        # 4. Web Retrieval
-        search_query = f"{entity_name} {place_name or ''} Tamil Nadu".strip()
+        # 4. Web Retrieval: Clean entity query formulation
+        search_query = entity_name.strip()
+        if "temple" not in search_query.lower() and "kovil" not in search_query.lower() and "monument" not in search_query.lower():
+            if place_name and place_name.lower() not in search_query.lower():
+                search_query = f"{search_query} {place_name} temple"
+            else:
+                search_query = f"{search_query} temple"
         searcher = search_fn or default_web_search
         candidate_urls = searcher(search_query, 8)
         logger.info(f"Retrieved {len(candidate_urls)} candidate URLs for query '{search_query}'")

@@ -268,14 +268,25 @@ def extract_claims(
     prompt = (
         f"Entity: {entity_name}\n"
         f"Place: {place_name or 'Tamil Nadu'}\n"
-        f"Target fields: {', '.join(fields_to_extract)}\n\n"
+        f"Target fields to extract if mentioned:\n"
+        "- name_en: English name of the heritage site\n"
+        "- name_ta: Tamil name of the heritage site\n"
+        "- primary_category: Site category (e.g. 'temple', 'fort', 'palace', 'monument', 'museum', etc.)\n"
+        "- district_id: District name where it is situated (e.g. 'Erode', 'Madurai', 'Thanjavur')\n"
+        "- deity: Presiding deity or deity worshipped (if a temple/religious site)\n"
+        "- builder: King, dynasty patron, or builder who erected/patronized the monument\n"
+        "- built_year: Year or century of establishment\n"
+        "- period: Historical period\n"
+        "- dynasty: Ruling dynasty (e.g. 'Chola', 'Pandya', 'Chera', 'Nayaka', 'Pallava')\n"
+        "- overview: 1-2 sentence high-level summary of the site\n"
+        "- history: Historical background, legends, or origins of the site\n\n"
         f"Page Text:\n\"\"\"\n{page_text[:12000]}\n\"\"\"\n\n"
         "Instructions:\n"
         "Extract factual claims for the specified entity from the page text. "
         "For each fact, output a JSON array of objects with keys:\n"
-        "- field: name of the field (e.g. 'builder', 'built_year', 'deity', 'festival', 'history', etc.)\n"
+        "- field: target field name (use exact field name from above)\n"
         "- raw_value: the extracted fact value as mentioned in text\n"
-        "- norm_value: standardized/normalized representation (e.g. 'Raja Raja Chola I', '1010 CE')\n"
+        "- norm_value: standardized representation\n"
         "- evidence_quote: CRITICAL REQUIREMENT: This MUST be an EXACT, VERBATIM substring copied directly from the page text above containing the proof.\n"
         "Return ONLY a JSON array."
     )
@@ -298,7 +309,11 @@ def extract_claims(
 
         verified_claims: List[Dict[str, Any]] = []
         for claim in raw_claims:
-            field = str(claim.get("field", "")).strip()
+            field = str(claim.get("field", "")).strip().lower()
+            if field in ("district", "district_name"):
+                field = "district_id"
+            elif field in ("category", "type", "monument_type"):
+                field = "primary_category"
             raw_val = str(claim.get("raw_value", "")).strip()
             norm_val = str(claim.get("norm_value", raw_val)).strip()
             quote = str(claim.get("evidence_quote", "")).strip()
@@ -306,8 +321,10 @@ def extract_claims(
             if not field or not raw_val or not quote:
                 continue
 
-            # Strict Hallucination Defense: quote must exist verbatim in page_text
-            if quote in page_text:
+            # Strict Hallucination Defense: quote must exist verbatim or normalized in page_text
+            quote_clean = re.sub(r"\s+", " ", quote).strip().lower()
+            page_clean = re.sub(r"\s+", " ", page_text).strip().lower()
+            if quote in page_text or quote_clean in page_clean:
                 verified_claims.append({
                     "field": field,
                     "raw_value": raw_val,

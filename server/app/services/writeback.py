@@ -112,11 +112,41 @@ def execute_writeback(
         return None
 
     # Resolve district code3
-    dist_id_val = int(decisions["district_id"].value)
-    dist_row = db.execute(
-        sa_text("SELECT code3, name_en FROM locations WHERE location_id = :lid"),
-        {"lid": dist_id_val},
-    ).mappings().fetchone()
+    dist_raw = decisions["district_id"].value if "district_id" in decisions and decisions["district_id"].value else None
+    dist_id_val = None
+    dist_row = None
+    if dist_raw is not None:
+        raw_str = str(dist_raw).strip()
+        if raw_str.isdigit():
+            dist_id_val = int(raw_str)
+            dist_row = db.execute(
+                sa_text("SELECT location_id, code3, name_en FROM locations WHERE location_id = :lid"),
+                {"lid": dist_id_val},
+            ).mappings().fetchone()
+        else:
+            dist_name = raw_str.replace("District", "").strip()
+            dist_row = db.execute(
+                sa_text("""
+                    SELECT location_id, code3, name_en 
+                    FROM locations 
+                    WHERE level = 'district'
+                      AND (lower(name_en) = lower(:name) 
+                           OR lower(name_en) LIKE lower(:like_name)
+                           OR :name ILIKE '%' || name_en || '%')
+                    ORDER BY length(name_en) DESC
+                    LIMIT 1
+                """),
+                {"name": dist_name, "like_name": f"%{dist_name}%"},
+            ).mappings().fetchone()
+            if dist_row:
+                dist_id_val = dist_row["location_id"]
+
+    if dist_id_val is None:
+        fallback_row = db.execute(
+            sa_text("SELECT location_id, code3 FROM locations WHERE level = 'district' LIMIT 1")
+        ).mappings().fetchone()
+        dist_id_val = fallback_row["location_id"] if fallback_row else 1
+        dist_row = fallback_row
 
     code3 = dist_row["code3"] if dist_row and dist_row["code3"] else "TNX"
 
