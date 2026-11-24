@@ -38,6 +38,7 @@ from app.services.spec_config import (
     GEMINI_CLASSIFY_TIMEOUT_SEC,
     RETRIEVAL_SCORE_THRESHOLD,
     RETRIEVAL_TOP_K,
+    SITE_DETECT_SIM_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
@@ -374,6 +375,39 @@ def detect_site(db: Session, query_text: str) -> Optional[str]:
     row = db.execute(sql, {"q": q_norm}).mappings().fetchone()
     if row and row["sim"] is not None and float(row["sim"]) >= 0.4:
         return str(row["site_id"])
+    return None
+
+
+def count_matching_sites(db: Session, query_text: str) -> int:
+    """Count number of distinct sites in site_aliases matching query with similarity >= 0.40 (Rule 2.2)."""
+    q_norm = query_text.lower().strip()
+    sql = sa_text("""
+        SELECT count(DISTINCT site_id)
+        FROM site_aliases
+        WHERE similarity(alias_norm, :q) >= :thresh
+    """)
+    return db.execute(sql, {"q": q_norm, "thresh": SITE_DETECT_SIM_THRESHOLD}).scalar() or 0
+
+
+def _find_partial_provisional_info(db: Session, entity_name: Optional[str]) -> Optional[str]:
+    """Find any provisional facts from site_facts or evidence_ledger if quota exhausted (Rule 2.1)."""
+    if not entity_name:
+        return None
+    try:
+        row = db.execute(sa_text("""
+            SELECT sf.field, sf.value
+            FROM site_facts sf
+            JOIN site_aliases sa ON sa.site_id = sf.site_id
+            WHERE similarity(sa.alias_norm, :ent) >= 0.4
+            LIMIT 1
+        """), {"ent": entity_name.lower().strip()}).mappings().fetchone()
+        if row:
+            return f"Provisional information: {row['field']} - {row['value']}"
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     return None
 
 
@@ -935,6 +969,174 @@ def process_chat_message(
     )
     detected_district = resolved_place.district_name or detect_district(db, clean_content)
 
+    # -------------------------------------------------------------------------
+    # Rule 2.2: Identity Clarification (disambiguate_query)
+    # Trigger when is_heritage and no district resolved and (entity_type = deity_or_generic_name OR db_matches_count >= 2 OR db_matches_count == 0)
+    # -------------------------------------------------------------------------
+    db_matches_count = count_matching_sites(db, clean_content)
+    should_disambiguate = (
+        is_heritage
+        and not detected_district
+        and (
+            entity_type == "deity_or_generic_name"
+            or db_matches_count >= 2
+            or db_matches_count == 0
+        )
+    )
+
+    if should_disambiguate:
+        t_disamb = time.time()
+        from app.augment.disambiguate import disambiguate_query
+        disamb_res = disambiguate_query(
+            db,
+            session_id=str(session_id),
+            asked_message_id=0,
+            entity_name=entity_name or extract_entity_name(clean_content),
+            entity_name_ta=entity_name_ta,
+            question_type=q_type,
+            original_query=clean_content,
+        )
+        tracer.record(
+            "disambiguation",
+            t_disamb,
+            input_data={"entity": entity_name, "entity_type": entity_type, "db_matches": db_matches_count},
+            output_data=disamb_res,
+        )
+
+        if disamb_res.get("status") == "needs_clarification":
+            candidates = disamb_res.get("candidates", [])
+            cand_lines = []
+            for idx, c in enumerate(candidates, start=1):
+                loc_part = f"{c.get('locality')}, " if c.get("locality") else ""
+                dist_part = c.get("district", "")
+                cand_lines.append(f"{idx}. {loc_part}{dist_part}".strip())
+
+            if detected_lang == "ta":
+                intro = f"'{entity_name or clean_content}' என்ற பெயரில் பல கோயில்கள் உள்ளன. நீங்கள் எந்த இடத்தைக் குறிப்பிடுகிறீர்கள்?\n\n"
+            elif detected_lang == "ta-Latn":
+                intro = f"'{entity_name or clean_content}' perula pala kovilgal irukku. Neenga endha edatha kekkareenga?\n\n"
+            elif detected_lang == "kn":
+                intro = f"'{entity_name or clean_content}' ಹೆಸರಿನಲ್ಲಿ ಹಲವು ದೇವಾಲಯಗಳಿವೆ. ನೀವು ಯಾವ ಸ್ಥಳವನ್ನು ಉದ್ದೇಶಿಸಿದ್ದೀರಿ?\n\n"
+            else:
+                intro = f"There are multiple temples known as '{entity_name or clean_content}'. Which location do you mean?\n\n"
+
+            assistant_content = intro + "\n".join(cand_lines)
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            # Persist user message
+            u_row = db.execute(sa_text("""
+                INSERT INTO chat_messages (
+                    session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+                ) VALUES (
+                    :session_id, 'user', :content, :lang, :q_type, NULL, NULL, now()
+                ) RETURNING message_id, created_at
+            """), {
+                "session_id": session_id,
+                "content": clean_content,
+                "lang": detected_lang,
+                "q_type": q_type,
+            }).mappings().fetchone()
+            user_message_id = u_row["message_id"]
+            user_created_at = u_row["created_at"]
+
+            # Update clarification asked_message_id
+            if disamb_res.get("clarification_id"):
+                db.execute(sa_text("""
+                    UPDATE clarifications
+                    SET asked_message_id = :mid
+                    WHERE clarification_id = :cid
+                """), {"mid": int(user_message_id), "cid": disamb_res["clarification_id"]})
+
+            # Persist assistant message
+            a_row = db.execute(sa_text("""
+                INSERT INTO chat_messages (
+                    session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+                ) VALUES (
+                    :session_id, 'assistant', :content, :lang, NULL, NULL, :reply_to, now()
+                ) RETURNING message_id, created_at
+            """), {
+                "session_id": session_id,
+                "content": assistant_content,
+                "lang": detected_lang,
+                "reply_to": user_message_id,
+            }).mappings().fetchone()
+            assistant_message_id = a_row["message_id"]
+            assistant_created_at = a_row["created_at"]
+
+            path_detail = {
+                "status": "needs_clarification",
+                "decision_code": DecisionCode.NEEDS_CLARIFICATION.value,
+                "decision_reason": DecisionCode.NEEDS_CLARIFICATION.value,
+                "clarification_id": disamb_res.get("clarification_id"),
+                "candidates": candidates,
+            }
+
+            db.execute(sa_text("""
+                INSERT INTO query_logs (
+                    message_id, query_text, query_lang, rewritten_en, resolved_site,
+                    path, top_score, chunk_ids, latency_ms, path_detail, gemini_calls, created_at
+                ) VALUES (
+                    :message_id, :query_text, :query_lang, NULL, NULL,
+                    'needs_clarification', 0.0, NULL, :latency_ms, CAST(:path_detail AS jsonb), :gemini_calls, now()
+                )
+            """), {
+                "message_id": user_message_id,
+                "query_text": clean_content,
+                "query_lang": detected_lang,
+                "latency_ms": latency_ms,
+                "path_detail": json.dumps(path_detail),
+                "gemini_calls": gemini_calls_count,
+            })
+
+            db.execute(sa_text("""
+                UPDATE chat_sessions
+                SET last_message_at = now(),
+                    title = CASE WHEN (title IS NULL OR title = 'New Chat') THEN :title ELSE title END
+                WHERE session_id = :sid
+            """), {
+                "sid": session_id,
+                "title": clean_content[:50],
+            })
+
+            tracer.flush(db, user_message_id)
+            db.commit()
+
+            user_payload = UserMessagePayload(
+                message_id=user_message_id,
+                session_id=session_id,
+                role="user",
+                content=clean_content,
+                lang=detected_lang,
+                question_type=q_type,
+                resolved_site=None,
+                created_at=user_created_at,
+            )
+            asst_payload = AssistantMessagePayload(
+                message_id=assistant_message_id,
+                session_id=session_id,
+                role="assistant",
+                content=assistant_content,
+                lang=detected_lang,
+                path="needs_clarification",
+                top_score=0.0,
+                latency_ms=latency_ms,
+                question_type=q_type,
+                resolved_site=None,
+                reply_to=user_message_id,
+                created_at=assistant_created_at,
+                citations=[],
+            )
+            resp = ChatMessageResponse(user_message=user_payload, assistant_message=asst_payload)
+            if idempotency_key:
+                _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
+            return resp
+
+        elif disamb_res.get("status") == "resolved_direct":
+            selected = disamb_res.get("selected_candidate") or {}
+            detected_district = selected.get("district")
+            clean_content = f"{entity_name or clean_content} {selected.get('locality', '')} {selected.get('district', '')}".strip()
+            logger.info(f"Disambiguation resolved direct to candidate: {selected}")
+
     # 4. Site detection
     t_site = time.time()
     resolved_site = detect_site(db, clean_content)
@@ -1025,6 +1227,7 @@ def process_chat_message(
                     "augment_job_id": str(aug_res.job_id),
                     "candidate_key": aug_res.candidate_key,
                     "status": aug_res.status,
+                    "decision_code": aug_res.decision_reason,
                     "decision_reason": aug_res.decision_reason,
                 }
 
@@ -1083,6 +1286,17 @@ def process_chat_message(
                         citations = []
                         used_chunk_ids = []
                         effective_resolved_site = None
+                elif aug_res.status == "quota_exhausted":
+                    path = "rejected"
+                    partial_info = _find_partial_provisional_info(db, extracted_entity)
+                    if partial_info:
+                        assistant_content = f"{partial_info}\n\nWeb checking is busy, please try again in a few minutes."
+                    else:
+                        assistant_content = "Web checking is busy, please try again in a few minutes."
+                    selected_chunks = []
+                    citations = []
+                    used_chunk_ids = []
+                    effective_resolved_site = None
                 else:
                     path = "rejected"
                     # Rule 1.5: Web check ran! Never say 'in our database', say what was checked

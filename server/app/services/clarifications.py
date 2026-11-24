@@ -1,14 +1,16 @@
 # Clarification service utilities
 
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
+
 from app.models.clarification import Clarification
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
+from app.services.spec_config import CLARIFICATION_EXPIRY_MINUTES
 
 def create_clarification(
     db: Session,
     session_id: str,
-    asked_message_id: str,
+    asked_message_id: int,
     entity_name: str,
     entity_name_ta: Optional[str],
     question_type: str,
@@ -18,7 +20,7 @@ def create_clarification(
     """Insert a new clarification entry with status 'open'."""
     clar = Clarification(
         session_id=session_id,
-        asked_message_id=asked_message_id,
+        asked_message_id=int(asked_message_id),
         entity_name=entity_name,
         entity_name_ta=entity_name_ta,
         question_type=question_type,
@@ -40,8 +42,11 @@ def get_open_clarification(db: Session, session_id: str) -> Optional[Clarificati
         .first()
     )
     if clar:
-        # expire after 30 minutes
-        if clar.created_at < datetime.utcnow() - timedelta(minutes=30):
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=CLARIFICATION_EXPIRY_MINUTES)
+        created = clar.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < cutoff:
             clar.status = "expired"
             db.commit()
             return None
@@ -58,7 +63,7 @@ def resolve_clarification(
         raise ValueError("Clarification not found")
     clar.status = "resolved"
     clar.resolved_option = resolved_option
-    clar.resolved_at = datetime.utcnow()
+    clar.resolved_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(clar)
     return clar

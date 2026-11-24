@@ -18,6 +18,7 @@ session. It will:
 """
 
 import logging
+import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Dict, Optional
@@ -30,6 +31,7 @@ from app.services.clarifications import (
     resolve_clarification,
     cancel_clarification,
 )
+from app.services.spec_config import CLARIFICATION_MATCH_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -39,22 +41,54 @@ def _similarity(a: str, b: str) -> int:
 
 
 def _match_option_text(reply: str, candidates: list) -> Optional[Dict]:
-    """Return the candidate dict with the highest similarity ≥85, or None.
+    """Return the matching candidate dict if reply matches an option, or None (Rule 2.2).
 
-    Each candidate is expected to contain at least a ``locality`` and
-    ``district`` field (or a combined ``label``). The function builds a
-    simple display string for matching.
+    Checks:
+    1. Numeric choice index (e.g. "1", "option 2", "#1").
+    2. Substring / token match on candidate locality or district.
+    3. Fuzzy match against label, locality, or district using CLARIFICATION_MATCH_THRESHOLD.
     """
+    reply_clean = reply.lower().strip()
+    if not reply_clean or not candidates:
+        return None
+
+    # Check numeric option choice (e.g. "1", "2", "option 1")
+    opt_match = re.search(r"^(?:option\s+|#)?(\d+)$", reply_clean)
+    if opt_match:
+        idx = int(opt_match.group(1)) - 1
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
+
+    reply_tokens = set(re.findall(r"\w+", reply_clean))
     best = None
     best_score = 0
+
     for cand in candidates:
-        # Build a human readable label – fallback to full_name if present
-        label = cand.get("label") or f"{cand.get('locality', '')} {cand.get('district', '')}".strip()
-        score = _similarity(reply, label)
-        if score > best_score:
-            best_score = score
-            best = cand
-    return best if best_score >= 85 else None
+        loc = (cand.get("locality") or "").lower().strip()
+        dist = (cand.get("district") or "").lower().strip()
+        label = (cand.get("label") or f"{loc} {dist}").lower().strip()
+
+        # Direct token / substring hit on locality
+        if loc and len(loc) >= 3:
+            if loc in reply_clean or any(t == loc for t in reply_tokens):
+                return cand
+
+        # Direct token / substring hit on district
+        if dist and len(dist) >= 3:
+            if dist in reply_clean or any(t == dist for t in reply_tokens):
+                return cand
+
+        # Fuzzy check against label, locality, and district
+        for target in [label, loc, dist]:
+            if target:
+                score = _similarity(reply_clean, target)
+                if score > best_score:
+                    best_score = score
+                    best = cand
+
+    if best_score >= CLARIFICATION_MATCH_THRESHOLD:
+        return best
+    return None
 
 
 def process_clarification_reply(

@@ -242,7 +242,7 @@ def classify_query(
         "Set to false for non-heritage queries like greetings ('hi', 'hello'), general bot questions ('what is ur name', 'who are you'), chit-chat, weather, sports, politics, math, or coding.\n"
         "- entity_name (string or null): specific monument/temple/fort in English (e.g. 'Pariyur Kondathu Kaliamman Temple')\n"
         "- entity_name_ta (string or null): entity name in Tamil script if available\n"
-        "- place_name (string or null): town, village, or district mentioned (e.g. 'Pollachi', 'Erode')\n"
+        "- place_name (string or null): town, village, or district EXPLICITLY mentioned in user's text (e.g. 'Pollachi', 'Erode'). CRITICAL: If the user did NOT explicitly write a place in their message, place_name MUST be null. NEVER guess or infer a place.\n"
         "- entity_type (string): one of ['specific_site', 'deity_or_generic_name', 'region_or_list', 'concept'].\n"
         "  Few-shot rules:\n"
         "  * 'ponniamman temple' without a place -> deity_or_generic_name\n"

@@ -148,6 +148,7 @@ class TestDisambiguateQuery:
 
         with patch("app.augment.disambiguate.get_open_clarification", return_value=None), \
              patch("app.augment.disambiguate._load_cached_candidates", return_value=candidates), \
+             patch("app.augment.disambiguate._discover_candidates_from_web", return_value=candidates), \
              patch("app.augment.disambiguate.create_clarification", return_value=MagicMock(clarification_id=uuid.uuid4())):
             result = disambiguate_query(
                 db=db,

@@ -38,6 +38,7 @@ from app.services.fact_consensus import (
     normalize_fact_value,
 )
 from app.services.gemini import classify_query, extract_claims
+from app.services.spec_config import DecisionCode
 from app.services.writeback import check_writeback_gate, execute_writeback
 
 logger = logging.getLogger(__name__)
@@ -274,43 +275,56 @@ def run_augmentation_pipeline(
         # 2. Candidate key
         candidate_key = normalize_candidate_key(entity_name, district_id)
 
-        # 3. Budget Check: max 1 job per candidate_key per 24 hours
-        recent_job = db.execute(
-            sa_text("""
-                SELECT job_id, status, site_id, started_at
-                FROM augment_jobs
-                WHERE candidate_key = :ck
-                  AND started_at >= (now() - interval '24 hours')
-                ORDER BY started_at DESC LIMIT 1
-            """),
-            {"ck": candidate_key},
-        ).mappings().fetchone()
+        # Rule 2.1: 24h Verified Reuse Only (24h per-candidate budget block removed)
+        # REUSE: if a job with the SAME candidate_key (entity + resolved district) finished 'verified' within 24 h -> answer from that site
+        # '|unknown' candidate keys are never reused.
+        # Every other previous outcome (failed, rejected, provisional, clarification) NEVER blocks a retry.
+        if candidate_key and not candidate_key.endswith("|unknown"):
+            recent_verified = db.execute(
+                sa_text("""
+                    SELECT job_id, status, site_id, started_at
+                    FROM augment_jobs
+                    WHERE candidate_key = :ck
+                      AND status = 'verified'
+                      AND site_id IS NOT NULL
+                      AND started_at >= (now() - interval '24 hours')
+                    ORDER BY started_at DESC LIMIT 1
+                """),
+                {"ck": candidate_key},
+            ).mappings().fetchone()
 
-        if recent_job:
-            if recent_job["site_id"] and recent_job["status"] == "verified":
-                logger.info(f"Reusing site_id {recent_job['site_id']} from recent job {recent_job['job_id']}")
+            if recent_verified and recent_verified["site_id"]:
+                logger.info(f"Reusing site_id {recent_verified['site_id']} from verified job {recent_verified['job_id']}")
                 return AugmentResult(
-                    job_id=recent_job["job_id"],
+                    job_id=recent_verified["job_id"],
                     candidate_key=candidate_key,
                     status="verified",
-                    site_id=recent_job["site_id"],
+                    site_id=recent_verified["site_id"],
                     entity_name=entity_name,
-                    decision_reason="Reused verified site from previous job within 24h budget window.",
-                    gemini_calls=gemini_calls,
+                    decision_reason=DecisionCode.VERIFIED_REUSED.value,
+                    gemini_calls=0,
                     latency_ms=int((time.time() - start_time) * 1000),
+                    sources_count=0,
                 )
-            else:
-                logger.info(f"Skipping budget: recent job {recent_job['job_id']} executed within 24h.")
-                return AugmentResult(
-                    job_id=recent_job["job_id"],
-                    candidate_key=candidate_key,
-                    status="skipped_budget",
-                    site_id=None,
-                    entity_name=entity_name,
-                    decision_reason="24-hour augmentation budget exceeded for this entity candidate.",
-                    gemini_calls=gemini_calls,
-                    latency_ms=int((time.time() - start_time) * 1000),
-                )
+
+        # Rule 2.1: Gemini daily quota check
+        from app.services.spec_config import GEMINI_DAILY_BUDGET
+        daily_calls = db.execute(
+            sa_text("SELECT COALESCE(SUM(gemini_calls), 0) FROM augment_jobs WHERE started_at >= date_trunc('day', now())")
+        ).scalar() or 0
+        if daily_calls >= GEMINI_DAILY_BUDGET:
+            logger.warning(f"Daily Gemini call budget reached ({daily_calls} >= {GEMINI_DAILY_BUDGET})")
+            return AugmentResult(
+                job_id=job_id,
+                candidate_key=candidate_key,
+                status="quota_exhausted",
+                site_id=None,
+                entity_name=entity_name,
+                decision_reason=DecisionCode.QUOTA_EXHAUSTED.value,
+                gemini_calls=0,
+                latency_ms=int((time.time() - start_time) * 1000),
+                sources_count=0,
+            )
 
         # Insert new augment_job row
         db.execute(
@@ -546,7 +560,15 @@ def run_augmentation_pipeline(
         }
 
         gate_passed, reason = check_writeback_gate(decisions)
-        final_status = "verified" if allocated_site_id else ("rejected_nonexistent" if not verified_map else "failed")
+        if allocated_site_id:
+            final_status = "verified"
+            decision_code = DecisionCode.VERIFIED_NEW.value
+        elif not verified_map:
+            final_status = "rejected_nonexistent"
+            decision_code = DecisionCode.EXISTENCE_NOT_CONFIRMED.value
+        else:
+            final_status = "failed"
+            decision_code = reason
         latency_ms = int((time.time() - start_time) * 1000)
 
         # 9. Update augment_jobs execution statistics
@@ -564,7 +586,7 @@ def run_augmentation_pipeline(
                 "g_calls": gemini_calls,
                 "g_tokens": gemini_tokens,
                 "status": final_status,
-                "reason": reason,
+                "reason": decision_code,
                 "jid": job_id,
             },
         )
@@ -576,7 +598,7 @@ def run_augmentation_pipeline(
             status=final_status,
             site_id=allocated_site_id,
             entity_name=entity_name,
-            decision_reason=reason,
+            decision_reason=decision_code,
             verified_fields=verified_map,
             gemini_calls=gemini_calls,
             gemini_tokens=gemini_tokens,
@@ -586,26 +608,34 @@ def run_augmentation_pipeline(
 
     except Exception as e:
         logger.error(f"Augmentation pipeline error: {e}", exc_info=True)
-        db.execute(
-            sa_text("""
-                UPDATE augment_jobs
-                SET status = 'failed',
-                    decision_reason = :reason,
-                    finished_at = now()
-                WHERE job_id = :jid
-            """),
-            {"reason": f"Pipeline failure: {str(e)}", "jid": job_id},
-        )
-        db.commit()
+        err_str = str(e).lower()
+        is_quota = "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str
+        err_status = "quota_exhausted" if is_quota else "failed"
+        err_reason = DecisionCode.QUOTA_EXHAUSTED.value if is_quota else f"Pipeline failure: {str(e)}"
+
+        if 'job_id' in locals():
+            db.execute(
+                sa_text("""
+                    UPDATE augment_jobs
+                    SET status = :status,
+                        decision_reason = :reason,
+                        finished_at = now()
+                    WHERE job_id = :jid
+                """),
+                {"status": err_status, "reason": err_reason, "jid": job_id},
+            )
+            db.commit()
+
         return AugmentResult(
-            job_id=job_id,
-            candidate_key="error",
-            status="failed",
+            job_id=job_id if 'job_id' in locals() else uuid.uuid4(),
+            candidate_key=candidate_key if 'candidate_key' in locals() else "error",
+            status=err_status,
             site_id=None,
-            entity_name=None,
-            decision_reason=str(e),
-            gemini_calls=gemini_calls,
+            entity_name=entity_name if 'entity_name' in locals() else None,
+            decision_reason=err_reason,
+            gemini_calls=gemini_calls if 'gemini_calls' in locals() else 0,
             latency_ms=int((time.time() - start_time) * 1000),
+            sources_count=len(candidate_urls) if 'candidate_urls' in locals() and candidate_urls else 0,
         )
     finally:
         if should_close:

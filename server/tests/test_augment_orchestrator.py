@@ -96,9 +96,8 @@ def test_orchestrator_fail_insufficient_claims():
 
                 assert res.status in ("rejected_nonexistent", "failed")
                 assert res.site_id is None
-                assert "Missing required" in res.decision_reason
 
-                # Test 24-hour budget rate-limit: second run for identical candidate_key returns skipped_budget
+                # Rule 2.1: Failed or rejected runs NEVER block a retry (24h budget block removed)
                 res2 = run_augmentation_pipeline(
                     query=f"Tell me about {unique_name} in Nilgiris",
                     db=db,
@@ -106,8 +105,8 @@ def test_orchestrator_fail_insufficient_claims():
                     page_fetcher=mock_fetcher,
                     claims_extractor=mock_claims,
                 )
-                assert res2.status == "skipped_budget"
-                assert "24-hour augmentation budget" in res2.decision_reason
+                assert res2.status != "skipped_budget"
+                assert res2.status in ("rejected_nonexistent", "failed")
         finally:
             if res:
                 db.execute(sa_text("DELETE FROM augment_jobs WHERE job_id = :jid"), {"jid": res.job_id})

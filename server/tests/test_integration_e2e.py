@@ -101,12 +101,13 @@ def test_e2e_identity_check_rejection():
         assert asst["resolved_site"] is None or asst["resolved_site"] != "TN-ERD-0001"
 
 
+@patch("app.services.gemini.classify_query")
 @patch("app.services.augment_orchestrator.classify_query")
 @patch("app.services.chat_pipeline.gemini_synthesize_answer")
 @patch("app.services.augment_orchestrator.default_web_search")
 @patch("app.services.augment_orchestrator.fetch_page_content")
 @patch("app.services.augment_orchestrator.extract_claims")
-def test_e2e_self_augmentation_lifecycle(mock_extract, mock_fetch, mock_search, mock_synth, mock_classify):
+def test_e2e_self_augmentation_lifecycle(mock_extract, mock_fetch, mock_search, mock_synth, mock_classify_orch, mock_classify):
     """E2E Test 4: Complete IC³-WB self-augmentation lifecycle.
 
     1. Question for an uncataloged heritage site triggers IC³-WB.
@@ -143,6 +144,7 @@ def test_e2e_self_augmentation_lifecycle(mock_extract, mock_fetch, mock_search, 
         "question_type": "history",
         "lang": "en",
     }
+    mock_classify_orch.return_value = mock_classify.return_value
     mock_synth.return_value = (
         "Annamalaiyar Temple is a renowned Hindu temple dedicated to Lord Shiva, located at the base of Annamalai hills "
         "in Tiruvannamalai. Built primarily during the Chola dynasty in the 9th century CE, it features grand gopurams."

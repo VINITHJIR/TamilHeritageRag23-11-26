@@ -59,6 +59,9 @@ RAPID_DOUBLE_POST_SECONDS: int = 3
 # Rule 1.1: Standard Gemini LLM call timeout (seconds)
 GEMINI_TIMEOUT_SEC: float = 30.0
 
+# Rule 2.1: Gemini daily call budget limit
+GEMINI_DAILY_BUDGET: int = 1000
+
 # Rule 3.2 / 5: Trigram similarity threshold on site_aliases for detect_site
 SITE_DETECT_SIM_THRESHOLD: float = 0.40
 
