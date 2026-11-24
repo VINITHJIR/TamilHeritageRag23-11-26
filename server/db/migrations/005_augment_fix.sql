@@ -55,3 +55,8 @@ ALTER TABLE field_decisions DROP CONSTRAINT IF EXISTS field_decisions_decision_c
 ALTER TABLE field_decisions ADD CONSTRAINT field_decisions_decision_check CHECK (
   decision IN ('verified', 'conflict', 'unconfirmed', 'rejected', 'expired')
 );
+
+-- 6. CLARIFICATIONS kind and field columns (Phase 4: kind = 'identity' | 'value')
+ALTER TABLE clarifications ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'identity' CHECK (kind IN ('identity', 'value'));
+ALTER TABLE clarifications ADD COLUMN IF NOT EXISTS field TEXT;
+

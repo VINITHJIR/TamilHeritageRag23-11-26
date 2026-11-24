@@ -21,6 +21,7 @@ from app.services.spec_config import (
     CONSENSUS_WEIGHT_SUM_THRESHOLD,
     CONFLICT_SUPPORT_RATIO_MIN,
     NUMERIC_TOLERANCE_RATIO,
+    MAX_VALUE_CHOICES,
 )
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,14 @@ def normalize_deity(raw: str) -> str:
     return raw.strip().title()
 
 
+VALID_CATEGORY_CODES = {
+    "temple", "monument", "museum", "fort", "palace", "rock_cut", "archaeological_site",
+    "memorial", "heritage_tourist_spot", "unesco", "asi_protected", "church", "mosque",
+    "dargah", "jain_site", "tomb_cemetery", "megalithic_site", "inscription", "cave",
+    "colonial_building", "step_well_tank", "other_monument"
+}
+
+
 def normalize_category(raw: str) -> str:
     """Normalize a raw category string to standard DB site category."""
     if not raw:
@@ -246,7 +255,9 @@ def normalize_category(raw: str) -> str:
     for k, v in CANONICAL_CATEGORIES.items():
         if k in clean:
             return v
-    return raw.strip().lower()
+    if clean in VALID_CATEGORY_CODES:
+        return clean
+    return "other_monument"
 
 
 def normalize_fact_value(field: str, raw: str) -> str:
@@ -286,6 +297,8 @@ class FieldDecisionResult:
     rule_fired: str
     competing: List[Dict[str, Any]] = field(default_factory=list)
     support_ratio: float = 0.0
+    options: List[Dict[str, Any]] = field(default_factory=list)
+
 
 
 # -----------------------------------------------------------------------------
@@ -381,6 +394,9 @@ def apply_conflict_merging_rules(
                 value_data[yk]["has_tier_a"] = value_data[yk]["has_tier_a"] or value_data[ck]["has_tier_a"]
                 value_data[yk]["has_quote_verified"] = value_data[yk]["has_quote_verified"] or value_data[ck]["has_quote_verified"]
                 value_data[yk]["raw_values"].update(value_data[ck]["raw_values"])
+                for s in value_data[ck].get("sources", []):
+                    if s not in value_data[yk].get("sources", []):
+                        value_data[yk].setdefault("sources", []).append(s)
                 del value_data[ck]
 
     if len(value_data) <= 1:
@@ -407,6 +423,9 @@ def apply_conflict_merging_rules(
                     value_data[primary_k]["has_tier_a"] = value_data[primary_k]["has_tier_a"] or value_data[sec_k]["has_tier_a"]
                     value_data[primary_k]["has_quote_verified"] = value_data[primary_k]["has_quote_verified"] or value_data[sec_k]["has_quote_verified"]
                     value_data[primary_k]["raw_values"].update(value_data[sec_k]["raw_values"])
+                    for s in value_data[sec_k].get("sources", []):
+                        if s not in value_data[primary_k].get("sources", []):
+                            value_data[primary_k].setdefault("sources", []).append(s)
                     del value_data[sec_k]
 
     return value_data
@@ -492,7 +511,16 @@ def evaluate_field_consensus(
                 "has_tier_a": False,
                 "has_quote_verified": False,
                 "raw_values": set(),
+                "sources": [],
             }
+
+        src_entry = {
+            "domain": c.get("domain"),
+            "tier": c.get("tier"),
+            "url": c.get("url"),
+        }
+        if src_entry not in value_data[val]["sources"]:
+            value_data[val]["sources"].append(src_entry)
 
         if tier == "A":
             value_data[val]["has_tier_a"] = True
@@ -538,6 +566,7 @@ def evaluate_field_consensus(
             "has_tier_a": data["has_tier_a"],
             "has_quote_verified": data["has_quote_verified"],
             "raw_values": list(data["raw_values"]),
+            "sources": data.get("sources", []),
         })
 
     total_field_weight = round(total_field_weight, 4)
@@ -560,6 +589,7 @@ def evaluate_field_consensus(
             "support_ratio": sv["support_ratio"],
             "n_clusters": sv["n_clusters"],
             "has_tier_a": sv["has_tier_a"],
+            "sources": sv.get("sources", []),
         }
         for sv in scored_values[1:]
     ]
@@ -614,6 +644,25 @@ def evaluate_field_consensus(
     )
 
     if two_tier_a_disagree or competing_ratios_high:
+        conflict_sorted = sorted(scored_values, key=lambda x: (x["has_tier_a"], x["support_ratio"]), reverse=True)
+        conflict_options: List[Dict[str, Any]] = []
+        for idx, sv in enumerate(conflict_sorted[:MAX_VALUE_CHOICES], start=1):
+            conflict_options.append({
+                "choice_id": str(idx),
+                "value": sv["value"],
+                "sources": sv.get("sources", []),
+                "support_ratio": sv["support_ratio"],
+                "has_tier_a": sv["has_tier_a"],
+            })
+        if conflict_options:
+            conflict_options.append({
+                "choice_id": str(len(conflict_options) + 1),
+                "value": "Compare all",
+                "sources": [],
+                "support_ratio": 0.0,
+                "has_tier_a": False,
+            })
+
         return FieldDecisionResult(
             field=field_name,
             decision="conflict",
@@ -624,6 +673,7 @@ def evaluate_field_consensus(
             rule_fired="conflict_competing_high_support" if competing_ratios_high else "conflict_tier_a_disagreement",
             competing=competing_entries,
             support_ratio=top_val["support_ratio"],
+            options=conflict_options,
         )
 
     # C. Check UNCONFIRMED:

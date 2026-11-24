@@ -16,8 +16,10 @@ def create_clarification(
     question_type: str,
     original_query: str,
     candidates: List[Dict],
+    kind: str = "identity",
+    field: Optional[str] = None,
 ) -> Clarification:
-    """Insert a new clarification entry with status 'open'."""
+    """Insert a new clarification entry with status 'open' (Rule 2.2 identity, Rule 4.3 value choice)."""
     clar = Clarification(
         session_id=session_id,
         asked_message_id=int(asked_message_id),
@@ -27,6 +29,8 @@ def create_clarification(
         original_query=original_query,
         candidates=candidates,
         status="open",
+        kind=kind,
+        field=field,
     )
     db.add(clar)
     db.commit()

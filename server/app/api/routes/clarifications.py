@@ -25,6 +25,8 @@ def get_open(session_id: str = Query(..., description="Session identifier"), db:
         "clarification_id": str(clar.clarification_id),
         "candidates": clar.candidates,
         "question_type": clar.question_type,
+        "kind": getattr(clar, "kind", "identity"),
+        "field": getattr(clar, "field", None),
     }
 
 @router.post("/respond", response_model=Dict)

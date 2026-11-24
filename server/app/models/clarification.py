@@ -16,6 +16,8 @@ class Clarification(Base):
     original_query = Column(Text, nullable=False)
     candidates = Column(JSONB, nullable=False)
     status = Column(Text, nullable=False, default="open")
+    kind = Column(Text, nullable=False, default="identity")
+    field = Column(Text, nullable=True)
     resolved_option = Column(JSONB)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
     resolved_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())

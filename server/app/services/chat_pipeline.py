@@ -39,6 +39,8 @@ from app.services.spec_config import (
     RETRIEVAL_SCORE_THRESHOLD,
     RETRIEVAL_TOP_K,
     SITE_DETECT_SIM_THRESHOLD,
+    PROVISIONAL_ANSWER_LABEL,
+    UNCONFIRMED_FIELD_PREFIX,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,7 +176,8 @@ def classify_question_type(text: str) -> str:
     # Out of scope first
     if any(w in t for w in [
         "வானிலை", "மழை", "கிரிக்கெட்", "weather", "temperature", "forecast", "cricket",
-        "ipl", "bitcoin", "crypto", "election", "politics", "python", "javascript", "coding"
+        "ipl", "bitcoin", "crypto", "election", "politics", "python", "javascript", "coding",
+        "stock", "market", "finance", "share price"
     ]):
         return "out_of_scope"
 
@@ -701,10 +704,157 @@ def process_chat_message(
             )
             if clar_result["status"] == "resolved":
                 selected = clar_result["selected_candidate"]
-                # Merge locality/district into clean_content for the downstream query
-                clean_content = (
-                    f"{open_clar.entity_name} {selected.get('locality', '')} {selected.get('district', '')}".strip()
-                )
+                if getattr(open_clar, "kind", "identity") == "value":
+                    # Value choice resolution (Rule 4.2)
+                    detected_lang = detect_language(clean_content)
+                    is_compare_all = selected.get("value") == "Compare all"
+                    choice_citations: List[CitationItem] = []
+                    if is_compare_all:
+                        lines = [f"Side-by-side comparison of sources for {open_clar.field or 'field'} of {open_clar.entity_name}:"]
+                        for c in (open_clar.candidates or []):
+                            if c.get("value") == "Compare all":
+                                continue
+                            c_val = c.get("value", "")
+                            c_ratio = int(c.get("support_ratio", 0) * 100)
+                            c_srcs = ", ".join(f"{s.get('domain')} [Tier {s.get('tier', 'C')}]" for s in c.get("sources", []) if s.get("domain")) or "sources"
+                            lines.append(f"- **{c_val}**: Supported by {c_srcs} ({c_ratio}%)")
+                            for s in c.get("sources", []):
+                                choice_citations.append(CitationItem(
+                                    chunk_id=str(uuid.uuid4()),
+                                    site_id="web",
+                                    site_name_en=open_clar.entity_name,
+                                    site_name_ta=open_clar.entity_name_ta,
+                                    section=open_clar.field or "history",
+                                    lang=detected_lang,
+                                    score=c.get("support_ratio", 0.5),
+                                    trust="high" if s.get("tier") == "A" else "medium",
+                                    origin=s.get("domain") or "web",
+                                    source_url=s.get("url"),
+                                ))
+                        assistant_content = "\n".join(lines)
+                    else:
+                        chosen_val = selected.get("value", "")
+                        chosen_srcs = ", ".join(f"{s.get('domain')} (Tier {s.get('tier', 'C')})" for s in selected.get("sources", []) if s.get("domain")) or "sources"
+                        other_options = [c.get("value") for c in (open_clar.candidates or []) if c.get("value") and c.get("value") not in (chosen_val, "Compare all")]
+                        other_note = f" (Note: other sources also report {', '.join(other_options)}.)" if other_options else ""
+                        assistant_content = f"According to {chosen_srcs}, the {open_clar.field or 'field'} of {open_clar.entity_name} is **{chosen_val}**.{other_note}"
+                        for s in selected.get("sources", []):
+                            choice_citations.append(CitationItem(
+                                chunk_id=str(uuid.uuid4()),
+                                site_id="web",
+                                site_name_en=open_clar.entity_name,
+                                site_name_ta=open_clar.entity_name_ta,
+                                section=open_clar.field or "history",
+                                lang=detected_lang,
+                                score=selected.get("support_ratio", 1.0),
+                                trust="high" if s.get("tier") == "A" else "medium",
+                                origin=s.get("domain") or "web",
+                                source_url=s.get("url"),
+                            ))
+
+                    # Persist user message
+                    u_row = db.execute(sa_text("""
+                        INSERT INTO chat_messages (
+                            session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+                        ) VALUES (
+                            :session_id, 'user', :content, :lang, :q_type, NULL, NULL, now()
+                        ) RETURNING message_id, created_at
+                    """), {
+                        "session_id": session_id,
+                        "content": clean_content,
+                        "lang": detected_lang,
+                        "q_type": open_clar.question_type or "general_heritage",
+                    }).mappings().fetchone()
+                    user_message_id = u_row["message_id"]
+                    user_created_at = u_row["created_at"]
+
+                    # Persist assistant message
+                    a_row = db.execute(sa_text("""
+                        INSERT INTO chat_messages (
+                            session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+                        ) VALUES (
+                            :session_id, 'assistant', :content, :lang, NULL, NULL, :reply_to, now()
+                        ) RETURNING message_id, created_at
+                    """), {
+                        "session_id": session_id,
+                        "content": assistant_content,
+                        "lang": detected_lang,
+                        "reply_to": user_message_id,
+                    }).mappings().fetchone()
+                    assistant_message_id = a_row["message_id"]
+                    assistant_created_at = a_row["created_at"]
+
+                    # Record pick in option_choices table (Rule 4.2: for analytics ONLY)
+                    sess_row = db.execute(sa_text("SELECT user_id FROM chat_sessions WHERE session_id = :sid"), {"sid": session_id}).fetchone()
+                    uid = sess_row[0] if sess_row else None
+                    db.execute(sa_text("""
+                        INSERT INTO option_choices (
+                            choice_id, message_id, user_id, field, chosen_value, options, created_at
+                        ) VALUES (
+                            gen_random_uuid(), :mid, :uid, :field, :chosen_val, CAST(:options AS jsonb), now()
+                        )
+                    """), {
+                        "mid": user_message_id,
+                        "uid": uid,
+                        "field": open_clar.field or "unknown",
+                        "chosen_val": selected.get("value", clean_content),
+                        "options": json.dumps(open_clar.candidates or []),
+                    })
+
+                    # Record query_log
+                    db.execute(sa_text("""
+                        INSERT INTO query_logs (
+                            message_id, query_text, query_lang, rewritten_en, resolved_site,
+                            path, top_score, chunk_ids, latency_ms, path_detail, gemini_calls, created_at
+                        ) VALUES (
+                            :message_id, :query_text, :query_lang, NULL, NULL,
+                            'web_consensus', 1.0, NULL, :latency_ms, CAST(:path_detail AS jsonb), 0, now()
+                        )
+                    """), {
+                        "message_id": user_message_id,
+                        "query_text": clean_content,
+                        "query_lang": detected_lang,
+                        "latency_ms": int((time.time() - start_time) * 1000),
+                        "path_detail": json.dumps({
+                            "status": "verified",
+                            "decision_code": DecisionCode.VERIFIED_NEW.value,
+                            "kind": "value_choice",
+                            "field": open_clar.field,
+                            "chosen_value": selected.get("value"),
+                        }),
+                    })
+                    db.commit()
+
+                    resp = ChatMessageResponse(
+                        user_message=UserMessagePayload(
+                            message_id=user_message_id,
+                            session_id=session_id,
+                            role="user",
+                            content=clean_content,
+                            created_at=user_created_at.isoformat() if hasattr(user_created_at, "isoformat") else str(user_created_at),
+                        ),
+                        assistant_message=AssistantMessagePayload(
+                            message_id=assistant_message_id,
+                            session_id=session_id,
+                            role="assistant",
+                            content=assistant_content,
+                            path="web_consensus",
+                            resolved_site=None,
+                            lang=detected_lang,
+                            question_type=open_clar.question_type or "general_heritage",
+                            citations=choice_citations,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            created_at=assistant_created_at.isoformat() if hasattr(assistant_created_at, "isoformat") else str(assistant_created_at),
+                        ),
+                    )
+                    if idempotency_key:
+                        _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
+                    return resp
+                else:
+                    # Identity clarification resolution (Rule 2.2)
+                    clean_content = (
+                        f"{open_clar.entity_name} {selected.get('locality', '')} {selected.get('district', '')}".strip()
+                    )
     except Exception as _clar_err:
         logger.warning(f"Clarification pre-hook failed (non-fatal): {_clar_err}")
 
@@ -1210,6 +1360,8 @@ def process_chat_message(
                     message_id=None,
                     lang=detected_lang,
                     db=db,
+                    classification=classification,
+                    asked_field=asked_field,
                 )
                 gemini_calls_count += aug_res.gemini_calls
                 tracer.record(
@@ -1231,7 +1383,72 @@ def process_chat_message(
                     "decision_reason": aug_res.decision_reason,
                 }
 
-                if aug_res.status == "verified" and aug_res.site_id:
+                if aug_res.status == "needs_choice":
+                    # Rule 4.2: Value choice for CONFLICT on the field the user asked about
+                    path = "needs_choice"
+                    effective_resolved_site = aug_res.site_id
+                    field_label = aug_res.asked_field or "this field"
+                    lines = [f"Sources give different answers for {field_label}:"]
+                    citations = []
+                    used_chunk_ids = []
+                    for opt in (aug_res.conflict_options or []):
+                        if opt.get("value") == "Compare all":
+                            lines.append(f"{opt['choice_id']}. Compare all")
+                        else:
+                            src_names = ", ".join(f"{s.get('domain')} [Tier {s.get('tier', 'C')}]" for s in opt.get("sources", []) if s.get("domain")) or "web sources"
+                            ratio_pct = int(opt.get("support_ratio", 0) * 100)
+                            lines.append(f"{opt['choice_id']}. {opt['value']} ({src_names}) [{ratio_pct}%]")
+                            for s in opt.get("sources", []):
+                                citations.append(CitationItem(
+                                    chunk_id=str(uuid.uuid4()),
+                                    site_id=aug_res.site_id or "web",
+                                    site_name_en=aug_res.entity_name or extracted_entity,
+                                    site_name_ta=None,
+                                    section=field_label,
+                                    lang=detected_lang,
+                                    score=opt.get("support_ratio", 0.5),
+                                    trust="high" if s.get("tier") == "A" else "medium",
+                                    origin=s.get("domain") or "web",
+                                    source_url=s.get("url"),
+                                ))
+                    lines.append("\nWhich source's details would you like to see?")
+                    assistant_content = "\n".join(lines)
+                    selected_chunks = []
+                elif aug_res.status == "provisional":
+                    # Rule 4.1: Provisional answer (nothing unverified is stored as fact)
+                    path = "web_provisional"
+                    effective_resolved_site = None
+                    prov_label = PROVISIONAL_ANSWER_LABEL.get(detected_lang, PROVISIONAL_ANSWER_LABEL["en"])
+                    lines = [f"{prov_label}:"]
+                    citations = []
+                    used_chunk_ids = []
+                    seen_claims = set()
+                    for pc in (aug_res.provisional_claims or []):
+                        f_name = pc["field"].replace("_", " ").capitalize()
+                        val = pc["value"]
+                        key = (f_name, val)
+                        if key in seen_claims:
+                            continue
+                        seen_claims.add(key)
+                        dom = pc.get("domain") or "web"
+                        tier = pc.get("tier") or "C"
+                        url = pc.get("url") or ""
+                        lines.append(f"- **{f_name}**: {val} – *{dom}* (Tier {tier}, {url})")
+                        citations.append(CitationItem(
+                            chunk_id=str(uuid.uuid4()),
+                            site_id="web_provisional",
+                            site_name_en=aug_res.entity_name or extracted_entity,
+                            site_name_ta=None,
+                            section=pc["field"],
+                            lang=detected_lang,
+                            score=0.5,
+                            trust="low",
+                            origin=dom,
+                            source_url=url,
+                        ))
+                    assistant_content = "\n".join(lines)
+                    selected_chunks = []
+                elif aug_res.status == "verified" and aug_res.site_id:
                     # Re-run Qdrant retrieval for this query (it will now find the newly written chunks!)
                     new_ranked = search_and_rank_chunks(
                         query_text=clean_content,
@@ -1276,6 +1493,22 @@ def process_chat_message(
                         ]
                         assistant_content = gemini_synthesize_answer(clean_content, facts_for_synth, lang=detected_lang)
                         gemini_calls_count += 1
+
+                        # Rule 4.1: Append unconfirmed fields if any
+                        if getattr(aug_res, "unconfirmed_fields", None):
+                            prefix = UNCONFIRMED_FIELD_PREFIX.get(detected_lang, UNCONFIRMED_FIELD_PREFIX["en"])
+                            for u_field, u_info in aug_res.unconfirmed_fields.items():
+                                u_val = u_info.get("value")
+                                u_srcs = ", ".join(s.get("domain") for s in u_info.get("sources", []) if s.get("domain")) or "web source"
+                                assistant_content += f"\n\n{prefix}: {u_field.replace('_', ' ').capitalize()} - {u_val} – {u_srcs}"
+
+                        # Rule 4.2: Append conflicts on unasked fields if any
+                        if getattr(aug_res, "conflict_fields", None):
+                            for c_field, c_opts in aug_res.conflict_fields.items():
+                                if c_field != aug_res.asked_field:
+                                    c_vals = " vs ".join(o.get("value") for o in c_opts if o.get("value") and o.get("value") != "Compare all")
+                                    if c_vals:
+                                        assistant_content += f"\n\n(Note: Sources report conflicting accounts for {c_field.replace('_', ' ')}: {c_vals}.)"
                     else:
                         path = "rejected"
                         n_sources = getattr(aug_res, "sources_count", 0) or 7
@@ -1411,6 +1644,25 @@ def process_chat_message(
     assistant_message_id = a_row["message_id"]
     assistant_created_at = a_row["created_at"]
 
+    # 7b-2. Rule 4.3: If path == 'needs_choice', record value choice clarification
+    if path == "needs_choice" and 'aug_res' in locals() and aug_res and getattr(aug_res, "conflict_options", None):
+        try:
+            from app.services.clarifications import create_clarification
+            create_clarification(
+                db=db,
+                session_id=str(session_id),
+                asked_message_id=user_message_id,
+                entity_name=aug_res.entity_name or extracted_entity or "this site",
+                entity_name_ta=None,
+                question_type=q_type,
+                original_query=clean_content,
+                candidates=aug_res.conflict_options,
+                kind="value",
+                field=aug_res.asked_field or "field",
+            )
+        except Exception as _cl_err:
+            logger.warning(f"Failed to record value choice clarification: {_cl_err}")
+
     # 7c. Citations
     cit_stmt = sa_text("""
         INSERT INTO message_citations (message_id, chunk_id, rank, score)
@@ -1418,12 +1670,17 @@ def process_chat_message(
         ON CONFLICT (message_id, chunk_id) DO NOTHING
     """)
     for rank, cit in enumerate(citations, start=1):
-        db.execute(cit_stmt, {
-            "message_id": assistant_message_id,
-            "chunk_id": uuid.UUID(cit.chunk_id),
-            "rank": rank,
-            "score": cit.score,
-        })
+        if used_chunk_ids and cit.chunk_id in used_chunk_ids:
+            try:
+                db.execute(cit_stmt, {
+                    "message_id": assistant_message_id,
+                    "chunk_id": uuid.UUID(cit.chunk_id),
+                    "rank": rank,
+                    "score": cit.score,
+                })
+            except Exception:
+                # Synthetic / web citation not in chunk_registry table
+                pass
 
     # 7d. Query logs
     log_stmt = sa_text("""

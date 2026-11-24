@@ -162,8 +162,26 @@ COMPLETENESS_COMPLETE_MIN: int = 4
 # Rule 3.8: Maximum quote-anchored summary sentences per page for chunks
 MAX_SUMMARY_SENTENCES_PER_PAGE: int = 3
 
-# Rule 4.2: Maximum options to present in value choice prompt
+# Rule 4.1: Multilingual provisional answer label
+PROVISIONAL_ANSWER_LABEL: dict[str, str] = {
+    "en": "Provisional – not confirmed by enough sources yet",
+    "ta": "தற்காலிகமானது – போதுமான ஆதாரங்களால் இன்னும் உறுதிப்படுத்தப்படவில்லை",
+    "ta-Latn": "Provisional – pothumaana aathaarangalodu innum uruthi seyyapadavillai",
+    "kn": "ತಾತ್ಕಾಲಿಕ – ಸಾಕಷ್ಟು ಮೂಲಗಳಿಂದ ಇನ್ನೂ ದೃಢಪಟ್ಟಿಲ್ಲ",
+}
+
+# Rule 4.1: Multilingual prefix for unconfirmed fields when existence accepted
+UNCONFIRMED_FIELD_PREFIX: dict[str, str] = {
+    "en": "Unconfirmed (1 source)",
+    "ta": "உறுதிப்படுத்தப்படாதது (1 ஆதாரம்)",
+    "ta-Latn": "Unconfirmed (1 source)",
+    "kn": "ದೃಢಪಡಿಸದ (1 ಮೂಲ)",
+}
+
+# Rule 4.2: Value choice option bounds for conflicting fields
+MIN_VALUE_CHOICES: int = 2
 MAX_VALUE_CHOICES: int = 4
+
 
 # Rule 6c: Multi-source web search URL budget (maximum candidate URLs fetched)
 MAX_WEB_URLS: int = 8

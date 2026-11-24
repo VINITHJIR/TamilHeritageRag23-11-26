@@ -27,6 +27,8 @@ function renderSafeMarkdown(content) {
 
   lines.forEach((line, lineIdx) => {
     const trimmed = line.trim();
+    const unconfMatch = trimmed.match(/^(?:Unconfirmed \(1 source\)|உறுதிப்படுத்தப்படாதது \(1 ஆதாரம்\)|Unconfirmed \(1 source\)):\s*(.*)$/i);
+
     if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
       currentList.push(trimmed.slice(2));
     } else if (/^\d+\.\s/.test(trimmed)) {
@@ -36,6 +38,13 @@ function renderSafeMarkdown(content) {
       if (trimmed === '') {
         // Empty spacer
         elements.push(<div key={`sp-${lineIdx}`} className="chat-markdown-gap" />);
+      } else if (unconfMatch) {
+        elements.push(
+          <p key={`p-${lineIdx}`} className="chat-markdown-p">
+            <span className="badge-unconfirmed">1 source</span>
+            {parseInlineFormatting(unconfMatch[1])}
+          </p>
+        );
       } else {
         elements.push(
           <p key={`p-${lineIdx}`} className="chat-markdown-p">
@@ -51,9 +60,9 @@ function renderSafeMarkdown(content) {
 }
 
 function parseInlineFormatting(text) {
-  // Simple token parser for **bold**, *italic*, `code`
+  // Token parser for **bold**, *italic*, `code`, and [markdown links](url) / raw URLs
   const parts = [];
-  const regex = /(\*\*.*?\*\*|\*.*?\*|`.*?`)/g;
+  const regex = /(\*\*.*?\*\*|\*.*?\*|`.*?`|\[(.*?)\]\((https?:\/\/.*?)\)|https?:\/\/[^\s\)<]+)/g;
   let lastIndex = 0;
   let match;
 
@@ -68,6 +77,19 @@ function parseInlineFormatting(text) {
       parts.push(<em key={match.index}>{token.slice(1, -1)}</em>);
     } else if (token.startsWith('`') && token.endsWith('`')) {
       parts.push(<code key={match.index} className="chat-inline-code">{token.slice(1, -1)}</code>);
+    } else if (match[2] && match[3]) {
+      // [label](url)
+      parts.push(
+        <a key={match.index} href={match[3]} target="_blank" rel="noopener noreferrer" className="chat-link">
+          {match[2]}
+        </a>
+      );
+    } else if (token.startsWith('http://') || token.startsWith('https://')) {
+      parts.push(
+        <a key={match.index} href={token} target="_blank" rel="noopener noreferrer" className="chat-link">
+          {token}
+        </a>
+      );
     }
     lastIndex = regex.lastIndex;
   }
@@ -137,6 +159,9 @@ export default function ChatMessage({ message, onFeedback }) {
     rejected: { label: 'No reliable info', className: 'badge-path-rejected' },
     web_pending: { label: 'Checking sources…', className: 'badge-path-pending' },
     web_consensus: { label: 'Verified from web', className: 'badge-path-web' },
+    web_provisional: { label: 'Provisional', className: 'badge-path-provisional' },
+    needs_choice: { label: 'Choice needed', className: 'badge-path-choice' },
+    needs_clarification: { label: 'Clarification', className: 'badge-path-clarification' },
     greeting: { label: 'Assistant', className: 'badge-path-greeting' },
   };
 

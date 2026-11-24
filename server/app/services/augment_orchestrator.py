@@ -43,6 +43,8 @@ from app.services.spec_config import (
     CONSENSUS_FIELDS,
     EXISTENCE_MIN_TIER_A_CLUSTERS,
     EXISTENCE_MIN_INDEPENDENT_CLUSTERS,
+    MIN_VALUE_CHOICES,
+    MAX_VALUE_CHOICES,
 )
 from app.services.writeback import check_writeback_gate, execute_writeback
 
@@ -56,11 +58,17 @@ TARGET_FIELDS = CONSENSUS_FIELDS
 class AugmentResult:
     job_id: uuid.UUID
     candidate_key: str
-    status: str  # 'verified' | 'rejected_nonexistent' | 'failed' | 'skipped_budget'
+    status: str  # 'verified' | 'provisional' | 'needs_choice' | 'rejected_nonexistent' | 'failed' | 'skipped_budget' | 'quota_exhausted'
     site_id: Optional[str]
     entity_name: Optional[str]
     decision_reason: str
     verified_fields: Dict[str, str] = field(default_factory=dict)
+    unconfirmed_fields: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    conflict_fields: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    provisional_claims: List[Dict[str, Any]] = field(default_factory=list)
+    conflict_options: List[Dict[str, Any]] = field(default_factory=list)
+    asked_field: Optional[str] = None
+    decisions: Dict[str, Any] = field(default_factory=dict)
     gemini_calls: int = 0
     gemini_tokens: int = 0
     latency_ms: int = 0
@@ -320,6 +328,8 @@ def run_augmentation_pipeline(
     search_fn: Optional[Callable[[str, int], List[str]]] = None,
     page_fetcher: Optional[Callable[[str], Optional[Tuple[str, int, str]]]] = None,
     claims_extractor: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+    classification: Optional[Dict[str, Any]] = None,
+    asked_field: Optional[str] = None,
 ) -> AugmentResult:
     """Execute the full autonomous IC³-WB self-augmentation pipeline.
 
@@ -346,14 +356,17 @@ def run_augmentation_pipeline(
 
     try:
         # 1. Classification
-        classification = classify_query(query, db=db)
-        gemini_calls += 1
+        if classification is None:
+            classification = classify_query(query, db=db)
+            gemini_calls += 1
         entity_name = classification.get("entity_name")
         entity_name_ta = classification.get("entity_name_ta")
         place_name = classification.get("place_name")
         district_id = classification.get("district_id")
         primary_category = classification.get("primary_category")
         is_heritage = classification.get("is_heritage", True)
+        if not asked_field:
+            asked_field = classification.get("asked_field")
 
         if not is_heritage or not entity_name:
             reason = "Query was classified as non-heritage or no specific entity was named."
@@ -653,7 +666,53 @@ def run_augmentation_pipeline(
             relevant_sources=relevant_sources,
         )
 
-        if allocated_site_id:
+        # Collect verified, unconfirmed, conflict, and provisional claims
+        verified_map = {f: d.value for f, d in decisions.items() if d.decision == "verified" and d.value}
+        unconfirmed_map = {
+            f: {
+                "value": d.value,
+                "sources": [
+                    {"domain": c.get("domain"), "tier": c.get("tier"), "url": c.get("url")}
+                    for c in all_extracted_claims
+                    if c["field"] == f and c.get("quote_found")
+                ],
+            }
+            for f, d in decisions.items()
+            if d.decision == "unconfirmed" and d.value
+        }
+        conflict_map = {
+            f: d.options
+            for f, d in decisions.items()
+            if d.decision == "conflict" and d.options
+        }
+        provisional_list = [
+            {
+                "field": c["field"],
+                "value": c.get("norm_value") or c.get("raw_value"),
+                "domain": c.get("domain"),
+                "tier": c.get("tier"),
+                "url": c.get("url"),
+                "quote": c.get("evidence_quote"),
+            }
+            for c in all_extracted_claims
+            if c.get("quote_found")
+        ]
+
+        # Check Rule 4.2: Conflict on the asked field
+        conflict_options: List[Dict[str, Any]] = []
+        asked_decision = decisions.get(asked_field) if asked_field else None
+        num_value_options = (len(asked_decision.options) - 1) if (asked_decision and asked_decision.options) else 0
+
+        if (
+            asked_field
+            and asked_decision
+            and asked_decision.decision == "conflict"
+            and (MIN_VALUE_CHOICES <= num_value_options <= MAX_VALUE_CHOICES)
+        ):
+            final_status = "needs_choice"
+            decision_code = DecisionCode.NEEDS_CHOICE.value
+            conflict_options = asked_decision.options
+        elif allocated_site_id:
             final_status = "verified"
             decision_code = DecisionCode.VERIFIED_NEW.value
         elif not existence_accepted:
@@ -668,7 +727,6 @@ def run_augmentation_pipeline(
             final_status = "failed"
             decision_code = DecisionCode.EXCEPTION.value
 
-        verified_map = {f: d.value for f, d in decisions.items() if d.decision == "verified" and d.value}
         latency_ms = int((time.time() - start_time) * 1000)
 
         # 9. Update augment_jobs execution statistics
@@ -700,6 +758,12 @@ def run_augmentation_pipeline(
             entity_name=entity_name,
             decision_reason=decision_code,
             verified_fields=verified_map,
+            unconfirmed_fields=unconfirmed_map,
+            conflict_fields=conflict_map,
+            provisional_claims=provisional_list,
+            conflict_options=conflict_options,
+            asked_field=asked_field,
+            decisions=decisions,
             gemini_calls=gemini_calls,
             gemini_tokens=gemini_tokens,
             latency_ms=latency_ms,

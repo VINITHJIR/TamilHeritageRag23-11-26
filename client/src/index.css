@@ -613,7 +613,28 @@ a:hover {
 .badge-path-rejected { background-color: #f1f5f9; color: #475569; }
 .badge-path-pending { background-color: #e0f2fe; color: #0284c7; }
 .badge-path-web { background-color: #ccfbf1; color: #0f766e; }
+.badge-path-provisional { background-color: #fef08a; color: #854d0e; font-weight: 600; }
+.badge-path-choice { background-color: #fed7aa; color: #9a3412; font-weight: 600; }
+.badge-path-clarification { background-color: #fef3c7; color: #92400e; }
 .badge-path-greeting { background-color: #fef3c7; color: #92400e; }
+
+.badge-unconfirmed { background-color: #fef08a; color: #854d0e; font-size: 0.75rem; padding: 2px 6px; border-radius: 4px; font-weight: 600; margin-right: 6px; display: inline-block; }
+.chat-link { color: #2563eb; text-decoration: underline; word-break: break-all; }
+.chat-link:hover { color: #1d4ed8; }
+
+.choice-cards-grid { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.choice-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; background: #ffffff; border: 1.5px solid #e2e8f0; border-radius: 8px; cursor: pointer; text-align: left; transition: all 0.15s ease-in-out; }
+.choice-card:hover { border-color: #3b82f6; box-shadow: 0 2px 8px rgba(59, 130, 246, 0.15); background: #f8fafc; }
+.choice-card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 0.95rem; color: #1e293b; }
+.choice-card-sources { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.badge-tier { font-size: 0.72rem; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+.badge-tier.tier-a { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+.badge-tier.tier-b { background: #e0f2fe; color: #0369a1; border: 1px solid #bae6fd; }
+.badge-tier.tier-c { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+.support-bar { display: flex; align-items: center; gap: 8px; width: 100%; margin-top: 4px; }
+.support-bar-track { flex: 1; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
+.support-bar-fill { height: 100%; background: #3b82f6; border-radius: 3px; }
+.support-bar-label { font-size: 0.75rem; color: #64748b; font-weight: 600; min-width: 32px; }
 
 .badge-section { background-color: #fef3c7; color: #92400e; }
 .badge-origin { background-color: #f1f5f9; color: #475569; }

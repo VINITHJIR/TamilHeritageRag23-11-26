@@ -160,7 +160,8 @@ def _rule_based_classify(clean_text: str, db: Optional[Session] = None) -> Dict[
         r"who\s+are\s+you",
         r"tell\s+me\s+a\s+joke",
         r"how\s+are\s+you",
-        r"weather", r"cricket", r"bitcoin", r"crypto", r"election"
+        r"weather", r"cricket", r"bitcoin", r"crypto", r"election",
+        r"stock", r"market", r"finance", r"share\s+price"
     ]
     if any(re.search(pat, clean_text, re.IGNORECASE) for pat in non_heritage_patterns):
         q_type = "out_of_scope"

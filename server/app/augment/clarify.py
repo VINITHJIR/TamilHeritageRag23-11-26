@@ -66,7 +66,22 @@ def _match_option_text(reply: str, candidates: list) -> Optional[Dict]:
     for cand in candidates:
         loc = (cand.get("locality") or "").lower().strip()
         dist = (cand.get("district") or "").lower().strip()
+        val = (cand.get("value") or "").lower().strip()
         label = (cand.get("label") or f"{loc} {dist}").lower().strip()
+        choice_id = str(cand.get("choice_id") or "").lower().strip()
+
+        # Direct choice_id match (e.g. "1", "2")
+        if choice_id and reply_clean == choice_id:
+            return cand
+
+        # "compare all" / "compare" special match
+        if val == "compare all" and reply_clean in ("compare all", "compare", "compare sources", "all"):
+            return cand
+
+        # Direct token / substring hit on value (for value choices)
+        if val and len(val) >= 3:
+            if val in reply_clean or reply_clean in val or any(t in val for t in reply_tokens if len(t) >= 4):
+                return cand
 
         # Direct token / substring hit on locality
         if loc and len(loc) >= 3:
@@ -78,8 +93,8 @@ def _match_option_text(reply: str, candidates: list) -> Optional[Dict]:
             if dist in reply_clean or any(t == dist for t in reply_tokens):
                 return cand
 
-        # Fuzzy check against label, locality, and district
-        for target in [label, loc, dist]:
+        # Fuzzy check against label, locality, district, and value
+        for target in [label, loc, dist, val]:
             if target:
                 score = _similarity(reply_clean, target)
                 if score > best_score:
@@ -110,14 +125,16 @@ def process_clarification_reply(
     if not clar:
         return {"status": "unresolved", "message": "No open clarification for this session."}
 
-    # Direct chip click handling
-    if "option_id" in reply_payload:
-        opt_id = reply_payload["option_id"]
-        # Find matching candidate by its internal ``option_id`` field
-        selected = next((c for c in clar.candidates if str(c.get("option_id")) == str(opt_id)), None)
+    # Direct chip/card click handling
+    if "option_id" in reply_payload or "choice_id" in reply_payload:
+        opt_id = str(reply_payload.get("option_id") or reply_payload.get("choice_id"))
+        selected = next(
+            (c for c in clar.candidates if str(c.get("option_id")) == opt_id or str(c.get("choice_id")) == opt_id),
+            None,
+        )
         if selected:
             resolve_clarification(db, str(clar.clarification_id), selected)
-            return {"status": "resolved", "selected_candidate": selected, "message": "Clarification resolved via chip selection."}
+            return {"status": "resolved", "selected_candidate": selected, "message": "Clarification resolved via selection."}
         else:
             # Unknown option – treat as cancelled
             cancel_clarification(db, str(clar.clarification_id))

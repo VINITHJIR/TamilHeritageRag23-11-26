@@ -199,6 +199,8 @@ export default function ChatPage() {
               clarification_id: clar.clarification_id,
               entity_name: content,
               candidates: clar.candidates,
+              kind: clar.kind || 'identity',
+              field: clar.field || null,
             });
           }
         } catch (_) {
@@ -400,6 +402,8 @@ export default function ChatPage() {
                       onTextSubmit={handleClarificationText}
                       isBusy={clarificationBusy}
                       stepLabel={clarificationStepLabel}
+                      kind={activeClarification.kind || 'identity'}
+                      field={activeClarification.field || null}
                     />
                   </div>
                 )}
