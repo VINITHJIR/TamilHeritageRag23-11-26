@@ -153,6 +153,9 @@ def execute_writeback(
     primary_category: Optional[str] = None,
     source_id: Optional[int] = None,
     relevant_sources: Optional[List[Dict[str, Any]]] = None,
+    source_id_map: Optional[Dict[str, int]] = None,
+    subdistrict_id: Optional[int] = None,
+    local_body_id: Optional[int] = None,
 ) -> Optional[str]:
     """Execute complete atomic write-back per Rules 3.5 - 3.8.
 
@@ -239,14 +242,20 @@ def execute_writeback(
     has_tier_a = any(d.has_tier_a for d in decisions.values())
     trust_level = "official" if has_tier_a else "multi_source"
 
-    # Insert into sites
+    # Rule 5.1: Initialize source_id_map if not provided
+    if source_id_map is None:
+        source_id_map = {}
+
+    # Insert into sites (Rule 5.3: include subdistrict_id, local_body_id)
     db.execute(
         sa_text("""
             INSERT INTO sites (
                 site_id, name_en, name_ta, primary_category, categories, district_id,
+                subdistrict_id, local_body_id,
                 period, dynasty, status, trust, origin, completeness, created_at, updated_at
             ) VALUES (
                 :site_id, :name_en, :name_ta, :primary_cat, ARRAY[:primary_cat], :district_id,
+                :subdistrict_id, :local_body_id,
                 :period, :dynasty, 'verified', CAST(:trust AS trust_level), 'web_consensus', :completeness, now(), now()
             )
         """),
@@ -256,6 +265,8 @@ def execute_writeback(
             "name_ta": name_ta,
             "primary_cat": final_primary_cat,
             "district_id": dist_id_val,
+            "subdistrict_id": subdistrict_id,
+            "local_body_id": local_body_id,
             "period": decisions.get("period").value if decisions.get("period") else None,
             "dynasty": decisions.get("dynasty").value if decisions.get("dynasty") else None,
             "trust": trust_level,
@@ -283,6 +294,17 @@ def execute_writeback(
         )
 
     # Insert field_decisions and site_facts
+    # Determine a primary source_id for provenance (use first used source if available)
+    primary_source_id = None
+    if relevant_sources:
+        first_url = relevant_sources[0].get("url")
+        primary_source_id = source_id_map.get(first_url)
+    else:
+        # fallback to any source in source_id_map
+        primary_source_id = next(iter(source_id_map.values()), None)
+    if primary_source_id is None:
+        primary_source_id = source_id
+    
     # Rule 3.8: UNCONFIRMED values are NOT written to chunks or site_facts.
     for f_name, dec in decisions.items():
         if not dec.value and not dec.decision:
@@ -332,7 +354,7 @@ def execute_writeback(
                     "field": f_name,
                     "value": dec.value,
                     "score": round(min(1.0, dec.support / 2.0), 3),
-                    "source_id": source_id,
+                    "source_id": primary_source_id,
                 },
             )
 
@@ -369,7 +391,7 @@ def execute_writeback(
             fact_card_lines.append(f"• {lbl}: {decisions[fk].value}")
 
     fact_card_en = "\n".join(fact_card_lines)
-    chunks_data.append(("fact_card", fact_card_en, "en", source_id))
+    chunks_data.append(("fact_card", fact_card_en, "en", primary_source_id))
 
     # (a) Tamil fact-card chunk if name_ta exists
     if name_ta:
@@ -393,7 +415,7 @@ def execute_writeback(
             if fk in decisions and decisions[fk].decision == "verified" and decisions[fk].value:
                 fact_card_ta_lines.append(f"• {lbl}: {decisions[fk].value}")
         fact_card_ta = "\n".join(fact_card_ta_lines)
-        chunks_data.append(("fact_card", fact_card_ta, "ta", source_id))
+        chunks_data.append(("fact_card", fact_card_ta, "ta", primary_source_id))
 
     # (b) Conflict-note chunk listing CONFLICT fields
     conflict_fields = [f for f, d in decisions.items() if d.decision == "conflict"]
@@ -406,7 +428,7 @@ def execute_writeback(
                 comp_vals.append(f"'{cp.get('value')}' (support {cp.get('support', 0):.2f})")
             conflict_lines.append(f"• {cf.replace('_', ' ').title()}: competing accounts include " + ", ".join(comp_vals))
         conflict_chunk_text = "\n".join(conflict_lines)
-        chunks_data.append(("conflict_notes", conflict_chunk_text, "en", source_id))
+        chunks_data.append(("conflict_notes", conflict_chunk_text, "en", primary_source_id))
 
     # (c) Up to 3 short summary sentences per page only if quote-anchored to that page
     if relevant_sources:
@@ -417,7 +439,7 @@ def execute_writeback(
                 all_evidence_quotes.append(d.value)
         for src in relevant_sources[:3]:
             page_text = src.get("text", "")
-            page_src_id = src.get("source_id", source_id)
+            page_src_id = source_id_map.get(src.get("url")) or primary_source_id
             sentences = _extract_quote_anchored_sentences(
                 page_text,
                 evidence_quotes=all_evidence_quotes,
@@ -429,7 +451,7 @@ def execute_writeback(
 
     # Fallback: if somehow only 1 chunk was generated and overview/history exist in decisions
     if len(chunks_data) < 2 and "overview" in decisions and decisions["overview"].value:
-        chunks_data.append(("overview", decisions["overview"].value.strip(), "en", source_id))
+        chunks_data.append(("overview", decisions["overview"].value.strip(), "en", primary_source_id))
 
     # 5. Embed chunks and persist to PostgreSQL chunk_registry & Qdrant
     for section_name, section_text, chunk_lang, chunk_src_id in chunks_data:
@@ -466,6 +488,22 @@ def execute_writeback(
             },
         )
 
+        # Rule 5.1: Resolve source_url and source_tier for Qdrant payload
+        chunk_source_url = None
+        chunk_source_tier = None
+        if source_id_map:
+            # Reverse lookup: find URL for this source_id
+            for url, sid in source_id_map.items():
+                if sid == chunk_src_id:
+                    chunk_source_url = url
+                    break
+        # Find tier from relevant_sources
+        if chunk_source_url and relevant_sources:
+            for rs in relevant_sources:
+                if rs.get("url") == chunk_source_url:
+                    chunk_source_tier = rs.get("tier")
+                    break
+
         points_to_upsert.append(
             models.PointStruct(
                 id=str(chunk_uuid),
@@ -480,6 +518,8 @@ def execute_writeback(
                     "trust": trust_level,
                     "origin": "web_consensus",
                     "source_id": chunk_src_id,
+                    "source_url": chunk_source_url,
+                    "source_tier": chunk_source_tier,
                 },
             )
         )

@@ -6,7 +6,7 @@ reliability = alpha / (alpha + beta).
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
@@ -46,6 +46,31 @@ def is_tier_b_host(host: str) -> bool:
     return h.endswith(".ac.in") or h.endswith(".edu") or h == "ac.in" or h == "edu"
 
 
+
+def _domain_suffixes(domain: str) -> List[str]:
+    """Return the host and each parent suffix with >= 2 labels, most specific first."""
+    parts = domain.split(".")
+    return [".".join(parts[i:]) for i in range(0, max(1, len(parts) - 1))]
+
+
+def _lookup_registered_domain(db: Session, domain: str):
+    """Find the source_domains row governing ``domain``.
+
+    Considers the host and all parent suffixes and returns the highest-tier
+    match (A > B > C), so an auto-created Tier-C row for a subdomain such as
+    ``en.wikipedia.org`` can never shadow a curated parent like ``wikipedia.org``.
+    Ties go to the most specific suffix.
+    """
+    suffixes = _domain_suffixes(domain)
+    rows = db.execute(
+        sa_text("SELECT domain, tier, prior, alpha, beta FROM source_domains WHERE domain = ANY(:doms)"),
+        {"doms": suffixes},
+    ).mappings().fetchall()
+    if not rows:
+        return None
+    return min(rows, key=lambda r: (str(r["tier"]), suffixes.index(r["domain"])))
+
+
 def get_domain_tier(url: str, db: Optional[Session] = None) -> Tuple[str, float]:
     """Determine domain tier and prior for a given URL.
 
@@ -72,24 +97,9 @@ def get_domain_tier(url: str, db: Optional[Session] = None) -> Tuple[str, float]
         should_close = True
 
     try:
-        row = db.execute(
-            sa_text("SELECT tier, prior FROM source_domains WHERE domain = :domain"),
-            {"domain": domain},
-        ).mappings().fetchone()
-
+        row = _lookup_registered_domain(db, domain)
         if row:
             return (str(row["tier"]), float(row["prior"]))
-
-        # Check subdomains (e.g. en.wikipedia.org -> wikipedia.org)
-        parts = domain.split(".")
-        if len(parts) > 2:
-            root_domain = ".".join(parts[-2:])
-            root_row = db.execute(
-                sa_text("SELECT tier, prior FROM source_domains WHERE domain = :root"),
-                {"root": root_domain},
-            ).mappings().fetchone()
-            if root_row:
-                return (str(root_row["tier"]), float(root_row["prior"]))
 
         # Fallback: insert as Tier C
         db.execute(
@@ -122,12 +132,10 @@ def update_domain_reliability(domain: str, accurate: bool, db: Optional[Session]
         should_close = True
 
     try:
-        row = db.execute(
-            sa_text("SELECT alpha, beta FROM source_domains WHERE domain = :domain"),
-            {"domain": clean_domain},
-        ).mappings().fetchone()
-
+        row = _lookup_registered_domain(db, clean_domain)
         if row:
+            # Credit the registered row (e.g. wikipedia.org for en.wikipedia.org)
+            clean_domain = row["domain"]
             new_alpha = float(row["alpha"]) + (1.0 if accurate else 0.0)
             new_beta = float(row["beta"]) + (0.0 if accurate else 1.0)
         else:

@@ -539,6 +539,27 @@ def run_augmentation_pipeline(
         logger.info(f"Existence check for '{entity_name}' in '{resolved_dist_name}': accepted={existence_accepted} ({existence_info})")
 
         # Persist augment_sources
+        # Upsert sources and build source_id_map
+        source_id_map = {}
+        for src in clustered_sources:
+            src_stmt = sa_text("""
+                INSERT INTO sources (url, domain, tier, fetched_at, content_hash)
+                VALUES (:url, :domain, :tier, now(), :content_hash)
+                ON CONFLICT (url) DO UPDATE SET
+                    content_hash = EXCLUDED.content_hash,
+                    fetched_at = now()
+                RETURNING source_id, url
+            """)
+            res = db.execute(src_stmt, {
+                "url": src["url"],
+                "domain": src.get("domain", ""),
+                "tier": src.get("tier", "C"),
+                "content_hash": src.get("sha256"),
+            }).fetchone()
+            if res:
+                source_id_map[res[1]] = res[0]
+        # Insert augment_sources rows (unchanged)
+
         for src in clustered_sources:
             is_used = src in relevant_sources[:5]
             db.execute(
@@ -625,10 +646,40 @@ def run_augmentation_pipeline(
                 )
         db.commit()
 
-        # 7. Consensus Evaluation (Rule 3.3, 3.4)
+        # 7. Rule 5.2: Cumulative Ledger Consensus – query ALL quote-verified claims
+        # from evidence_ledger for this candidate_key, not just current job's claims
+        cumulative_claims: List[Dict[str, Any]] = []
+        try:
+            ledger_rows = db.execute(
+                sa_text("""
+                    SELECT field, raw_value, norm_value, url, domain, tier,
+                           cluster_key, evidence_quote, quote_found
+                    FROM evidence_ledger
+                    WHERE candidate_key = :ck AND quote_found = true
+                """),
+                {"ck": candidate_key},
+            ).mappings().fetchall()
+            for lr in ledger_rows:
+                cumulative_claims.append({
+                    "field": lr["field"],
+                    "raw_value": lr["raw_value"],
+                    "norm_value": lr["norm_value"],
+                    "url": lr["url"],
+                    "domain": lr["domain"],
+                    "tier": lr["tier"],
+                    "domain_prior": {"A": 1.0, "B": 0.6, "C": 0.25}.get(lr["tier"], 0.25),
+                    "cluster_key": lr["cluster_key"],
+                    "evidence_quote": lr["evidence_quote"],
+                    "quote_found": lr["quote_found"],
+                })
+        except Exception as e:
+            logger.warning(f"Could not load cumulative ledger for {candidate_key}: {e}")
+            cumulative_claims = all_extracted_claims
+
+        # Consensus over cumulative claims (self-healing: Rule 5.2)
         decisions: Dict[str, FieldDecisionResult] = {}
         for f_name in TARGET_FIELDS:
-            f_claims = [c for c in all_extracted_claims if c["field"] == f_name]
+            f_claims = [c for c in cumulative_claims if c["field"] == f_name]
             dec = evaluate_field_consensus(f_name, f_claims)
             decisions[f_name] = dec
 
@@ -664,7 +715,35 @@ def run_augmentation_pipeline(
             primary_category=primary_category,
             source_id=None,
             relevant_sources=relevant_sources,
+            source_id_map=source_id_map,
+            subdistrict_id=classification.get("subdistrict_id"),
+            local_body_id=classification.get("local_body_id"),
         )
+
+        # Rule 5.2: After write-back, UPDATE evidence_ledger SET site_id
+        if allocated_site_id:
+            try:
+                db.execute(
+                    sa_text("UPDATE evidence_ledger SET site_id = :sid WHERE candidate_key = :ck"),
+                    {"sid": allocated_site_id, "ck": candidate_key},
+                )
+                db.commit()
+            except Exception as e:
+                logger.warning(f"Could not update evidence_ledger site_id: {e}")
+
+        # Rule 5.4: Domain reliability updates from consensus decisions
+        from app.services.domain_tiers import update_domain_reliability
+        for f_name, dec in decisions.items():
+            if dec.decision == "verified" and dec.value:
+                # Find clusters that agree/disagree with verified value
+                f_claims = [c for c in cumulative_claims if c["field"] == f_name]
+                for c in f_claims:
+                    norm_v = c.get("norm_value") or c.get("raw_value") or ""
+                    agrees = norm_v.strip().lower() == (dec.value or "").strip().lower()
+                    try:
+                        update_domain_reliability(c.get("domain", ""), accurate=agrees, db=db)
+                    except Exception:
+                        pass
 
         # Collect verified, unconfirmed, conflict, and provisional claims
         verified_map = {f: d.value for f, d in decisions.items() if d.decision == "verified" and d.value}
