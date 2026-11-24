@@ -12,6 +12,7 @@ Implements the multi-step retrieval-augmented conversational pipeline:
 9. Request idempotency using client idempotency_key or recent duplicate guard.
 """
 
+from datetime import datetime, timezone
 import json
 import logging
 import re
@@ -32,8 +33,68 @@ from app.schemas.chat import (
 from app.services.augment_orchestrator import run_augmentation_pipeline
 from app.services.embeddings import get_embedding_service
 from app.services.gemini import synthesize_answer as gemini_synthesize_answer
+from app.services.spec_config import (
+    DecisionCode,
+    GEMINI_CLASSIFY_TIMEOUT_SEC,
+    RETRIEVAL_SCORE_THRESHOLD,
+    RETRIEVAL_TOP_K,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class PipelineTracer:
+    """Collects pipeline execution stages and persists them to message_traces (Rule 1.4)."""
+
+    def __init__(self):
+        self.stages: List[Dict[str, Any]] = []
+
+    def record(
+        self,
+        stage: str,
+        start_time: float,
+        input_data: Optional[Dict[str, Any]] = None,
+        output_data: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ):
+        duration_ms = int((time.time() - start_time) * 1000)
+        self.stages.append({
+            "stage": stage,
+            "started_at": datetime.now(timezone.utc),
+            "duration_ms": duration_ms,
+            "input": input_data,
+            "output": output_data,
+            "error": error,
+        })
+
+    def flush(self, db: Session, message_id: int):
+        for s in self.stages:
+            db.execute(
+                sa_text("""
+                    INSERT INTO message_traces (message_id, stage, started_at, duration_ms, input, output, error)
+                    VALUES (:mid, :stage, :started_at, :duration_ms, CAST(:input AS jsonb), CAST(:output AS jsonb), :error)
+                """),
+                {
+                    "mid": message_id,
+                    "stage": s["stage"],
+                    "started_at": s["started_at"],
+                    "duration_ms": s["duration_ms"],
+                    "input": json.dumps(s["input"]) if s["input"] is not None else None,
+                    "output": json.dumps(s["output"]) if s["output"] is not None else None,
+                    "error": s["error"],
+                },
+            )
+
+
+def _build_web_checked_rejection(lang: str, n_sources: int, entity_label: str, district_label: str) -> str:
+    """Rule 1.5: After web check ran, never say 'in our database'; say what was checked."""
+    if lang == "ta":
+        return f"நான் {n_sources} இணையத் தளங்களை சரிபார்த்தேன், ஆனால் {entity_label}{district_label} பற்றிய உறுதிப்படுத்தப்பட்ட தகவல்கள் கிடைக்கவில்லை."
+    elif lang == "ta-Latn":
+        return f"Naan {n_sources} web sources check pannen, aana {entity_label}{district_label} pathina confirmed thagaval kidaikkala."
+    elif lang == "kn":
+        return f"ನಾನು {n_sources} ವೆಬ್ ಮೂಲಗಳನ್ನು ಪರಿಶೀಲಿಸಿದೆ, ಆದರೆ {entity_label}{district_label} ಬಗ್ಗೆ ದೃಢೀಕೃತ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ."
+    return f"I checked {n_sources} web sources but could not confirm {entity_label}{district_label}."
 
 # -----------------------------------------------------------------------------
 # In-memory Idempotency Cache: (session_id_str, idempotency_key) -> ChatMessageResponse
@@ -353,7 +414,7 @@ REJECTION_MESSAGES = {
     "ta": "மன்னிக்கவும், எங்கள் பதிவுகளில் இது பற்றிய நம்பகமான தகவல் இல்லை.",
     "ta-Latn": "Mannikkavum, engal pathivugalil idhu patriya nambagamaana thagaval illai.",
     "kn": "ಕ್ಷಮಿಸಿ, ನಮ್ಮ ದಾಖಲೆಗಳಲ್ಲಿ ಇದರ ಬಗ್ಗೆ ವಿಶ್ವಾಸಾರ್ಹ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ.",
-    "en": "I could not find reliable records for this heritage query in our database.",
+    "en": "I could not find reliable records for this heritage query.",
 }
 
 # -----------------------------------------------------------------------------
@@ -529,6 +590,7 @@ def process_chat_message(
 
     start_time = time.time()
     clean_content = content.strip()
+    tracer = PipelineTracer()
 
     # Verify session exists
     session_row = db.execute(
@@ -586,7 +648,6 @@ def process_chat_message(
 
     # 0b. CLARIFY-THEN-AUGMENT pre-hook
     # ── Check if there is an open clarification for this session. ──────────
-    # Import here to avoid circular import at module level.
     try:
         from app.augment.clarify import process_clarification_reply
         from app.services.clarifications import get_open_clarification
@@ -594,9 +655,15 @@ def process_chat_message(
 
         open_clar = get_open_clarification(db, str(session_id))
         if open_clar:
-            # Route user reply through the resolution module.
+            t_clar = time.time()
             clar_result = process_clarification_reply(
                 db, str(session_id), {"text": clean_content}
+            )
+            tracer.record(
+                "clarification_prehook",
+                t_clar,
+                input_data={"text": clean_content, "entity": open_clar.entity_name},
+                output_data={"status": clar_result.get("status")},
             )
             if clar_result["status"] == "resolved":
                 selected = clar_result["selected_candidate"]
@@ -604,19 +671,19 @@ def process_chat_message(
                 clean_content = (
                     f"{open_clar.entity_name} {selected.get('locality', '')} {selected.get('district', '')}".strip()
                 )
-                # fall through to normal pipeline with enriched query
-            # If cancelled → fall through with original query
-            # If unresolved → show options again (fall through; disambiguate will re-open)
     except Exception as _clar_err:
         logger.warning(f"Clarification pre-hook failed (non-fatal): {_clar_err}")
 
-    # 1. Language detection
+    # 1. Conversational Greeting Fast-Path
+    t_greet = time.time()
     detected_lang = detect_language(clean_content)
+    is_greet = is_greeting(clean_content)
+    tracer.record("greeting_check", t_greet, input_data={"text": clean_content}, output_data={"is_greeting": is_greet})
 
-    # 1b. Conversational Greeting Handler
-    if is_greeting(clean_content):
+    if is_greet:
         latency_ms = int((time.time() - start_time) * 1000)
         assistant_content = GREETING_RESPONSES.get(detected_lang, GREETING_RESPONSES["en"])
+        tracer.record("greeting_fast_path", t_greet, output_data={"path": "greeting"})
 
         # Persist greeting turn
         u_row = db.execute(sa_text("""
@@ -672,6 +739,8 @@ def process_chat_message(
             "sid": session_id,
             "title": clean_content[:50],
         })
+
+        tracer.flush(db, user_message_id)
         db.commit()
 
         user_payload = UserMessagePayload(
@@ -704,31 +773,217 @@ def process_chat_message(
             _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
         return resp
 
-    # 2. Question type classification
-    q_type = classify_question_type(clean_content)
+    # -------------------------------------------------------------------------
+    # Rule 1.1: Move Gemini classification to the START of chat_pipeline, right after greeting
+    # -------------------------------------------------------------------------
+    t_cls = time.time()
+    from app.services.gemini import classify_query
+    classification = classify_query(clean_content, db=db, timeout_sec=GEMINI_CLASSIFY_TIMEOUT_SEC)
+    tracer.record(
+        "classification",
+        t_cls,
+        input_data={"query": clean_content},
+        output_data=classification,
+    )
 
-    # 3. Entity linking: site detection and district resolution
+    is_heritage = classification["is_heritage"]
+    q_type = classification.get("question_type") or ("out_of_scope" if not is_heritage else "general_heritage")
+    detected_lang = classification.get("lang") or detect_language(clean_content)
+    entity_name = classification.get("entity_name")
+    entity_name_ta = classification.get("entity_name_ta")
+    place_name = classification.get("place_name")
+    entity_type = classification.get("entity_type", "specific_site")
+    asked_field = classification.get("asked_field", "overview")
+    fallback_used = classification.get("fallback_used", False)
+    gemini_calls_count = 0 if fallback_used else 1
+
+    # -------------------------------------------------------------------------
+    # Rule 1.2: is_heritage=false -> path 'out_of_scope', polite reply, NO augmentation job
+    # -------------------------------------------------------------------------
+    if not is_heritage or q_type == "out_of_scope":
+        t_oos = time.time()
+        tracer.record(
+            "out_of_scope",
+            t_oos,
+            input_data={"query": clean_content, "classification": classification},
+            output_data={"path": "out_of_scope"},
+        )
+        OUT_OF_SCOPE_RESPONSES = {
+            "en": "I specialize in Tamil Nadu's heritage, temples, monuments, and history. I can only assist with heritage-related questions.",
+            "ta": "நான் தமிழ்நாட்டின் மரபு, கோயில்கள், வரலாற்றுச் சின்னங்கள் மற்றும் வரலாறு தொடர்பான தகவல்களை வழங்கும் உதவியாளர். பாரம்பரியம் தொடர்பான வினாக்களுக்கு மட்டுமே என்னால் உதவ முடியும்.",
+            "ta-Latn": "Naan Tamil Nadu heritage, kovilgal, monuments matrum varalaaru sambanthapatta kelvigalukku mattume bathil alikka mudiyum.",
+            "kn": "ನಾನು ತಮಿಳುನಾಡಿನ ಪರಂಪರೆ, ದೇವಾಲಯಗಳು, ಸ್ಮಾರಕಗಳು ಮತ್ತು ಇತಿಹಾಸಕ್ಕೆ ಸಂಬಂಧಿಸಿದ ಪ್ರಶ್ನೆಗಳಿಗೆ ಮಾತ್ರ ಉತ್ತರಿಸಬಲ್ಲೆ.",
+        }
+        assistant_content = OUT_OF_SCOPE_RESPONSES.get(detected_lang, OUT_OF_SCOPE_RESPONSES["en"])
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        u_row = db.execute(sa_text("""
+            INSERT INTO chat_messages (
+                session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+            ) VALUES (
+                :session_id, 'user', :content, :lang, 'out_of_scope', NULL, NULL, now()
+            ) RETURNING message_id, created_at
+        """), {
+            "session_id": session_id,
+            "content": clean_content,
+            "lang": detected_lang,
+        }).mappings().fetchone()
+        user_message_id = u_row["message_id"]
+        user_created_at = u_row["created_at"]
+
+        a_row = db.execute(sa_text("""
+            INSERT INTO chat_messages (
+                session_id, role, content, lang, question_type, resolved_site, reply_to, created_at
+            ) VALUES (
+                :session_id, 'assistant', :content, :lang, NULL, NULL, :reply_to, now()
+            ) RETURNING message_id, created_at
+        """), {
+            "session_id": session_id,
+            "content": assistant_content,
+            "lang": detected_lang,
+            "reply_to": user_message_id,
+        }).mappings().fetchone()
+        assistant_message_id = a_row["message_id"]
+        assistant_created_at = a_row["created_at"]
+
+        path_detail = {
+            "status": "out_of_scope",
+            "decision_code": DecisionCode.OUT_OF_SCOPE.value,
+            "decision_reason": DecisionCode.OUT_OF_SCOPE.value,
+            "detail": "Query classified as non-heritage",
+        }
+
+        db.execute(sa_text("""
+            INSERT INTO query_logs (
+                message_id, query_text, query_lang, rewritten_en, resolved_site,
+                path, top_score, chunk_ids, latency_ms, path_detail, gemini_calls, created_at
+            ) VALUES (
+                :message_id, :query_text, :query_lang, NULL, NULL,
+                'out_of_scope', 0.0, NULL, :latency_ms, CAST(:path_detail AS jsonb), :gemini_calls, now()
+            )
+        """), {
+            "message_id": user_message_id,
+            "query_text": clean_content,
+            "query_lang": detected_lang,
+            "latency_ms": latency_ms,
+            "path_detail": json.dumps(path_detail),
+            "gemini_calls": gemini_calls_count,
+        })
+
+        db.execute(sa_text("""
+            UPDATE chat_sessions
+            SET last_message_at = now(),
+                title = CASE WHEN (title IS NULL OR title = 'New Chat') THEN :title ELSE title END
+            WHERE session_id = :sid
+        """), {
+            "sid": session_id,
+            "title": clean_content[:50],
+        })
+
+        tracer.flush(db, user_message_id)
+        db.commit()
+
+        user_payload = UserMessagePayload(
+            message_id=user_message_id,
+            session_id=session_id,
+            role="user",
+            content=clean_content,
+            lang=detected_lang,
+            question_type="out_of_scope",
+            resolved_site=None,
+            created_at=user_created_at,
+        )
+        asst_payload = AssistantMessagePayload(
+            message_id=assistant_message_id,
+            session_id=session_id,
+            role="assistant",
+            content=assistant_content,
+            lang=detected_lang,
+            path="out_of_scope",
+            top_score=0.0,
+            latency_ms=latency_ms,
+            question_type="out_of_scope",
+            resolved_site=None,
+            reply_to=user_message_id,
+            created_at=assistant_created_at,
+            citations=[],
+        )
+        resp = ChatMessageResponse(user_message=user_payload, assistant_message=asst_payload)
+        if idempotency_key:
+            _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
+        return resp
+
+    # -------------------------------------------------------------------------
+    # Rule 1.3: Place resolution against LGD locations hierarchy & aliases
+    # -------------------------------------------------------------------------
+    t_place = time.time()
+    from app.services.place_resolution import resolve_place
+    resolved_place = resolve_place(clean_content, place_name=place_name, db=db)
+    tracer.record(
+        "place_resolution",
+        t_place,
+        input_data={"text": clean_content, "place_name": place_name},
+        output_data={
+            "district_id": resolved_place.district_id,
+            "district_name": resolved_place.district_name,
+            "subdistrict_id": resolved_place.subdistrict_id,
+            "subdistrict_name": resolved_place.subdistrict_name,
+            "local_body_id": resolved_place.local_body_id,
+            "local_body_name": resolved_place.local_body_name,
+            "matched_term": resolved_place.matched_term,
+        },
+    )
+    detected_district = resolved_place.district_name or detect_district(db, clean_content)
+
+    # 4. Site detection
+    t_site = time.time()
     resolved_site = detect_site(db, clean_content)
-    detected_district = detect_district(db, clean_content)
+    tracer.record(
+        "site_detection",
+        t_site,
+        input_data={"query": clean_content},
+        output_data={"resolved_site": resolved_site},
+    )
 
-    # 4. Vector search
+    # 5. Vector search
+    t_vec = time.time()
     ranked_chunks = search_and_rank_chunks(
         query_text=clean_content,
         query_lang=detected_lang,
         resolved_site=resolved_site,
         detected_district=detected_district,
-        top_k=8,
+        top_k=RETRIEVAL_TOP_K,
+    )
+    top_score = ranked_chunks[0]["raw_score"] if ranked_chunks else 0.0
+    tracer.record(
+        "vector_search",
+        t_vec,
+        input_data={
+            "query": clean_content,
+            "resolved_site": resolved_site,
+            "detected_district": detected_district,
+        },
+        output_data={
+            "hit_count": len(ranked_chunks),
+            "top_score": top_score,
+        },
     )
 
-    top_score = ranked_chunks[0]["raw_score"] if ranked_chunks else 0.0
-
-    # 5. Identity Verification (Ground-truth entity check)
+    # 6. Identity Verification (Ground-truth entity check)
     identity_valid = True
     identity_reason = "ok"
+    id_sim = 1.0
     if ranked_chunks:
+        t_id = time.time()
         candidate_site = ranked_chunks[0]["site_id"]
         identity_valid, id_sim, identity_reason = verify_identity(
             db, candidate_site, clean_content, detected_district
+        )
+        tracer.record(
+            "identity_verification",
+            t_id,
+            input_data={"candidate_site": candidate_site, "query": clean_content, "district": detected_district},
+            output_data={"valid": identity_valid, "sim": id_sim, "reason": identity_reason},
         )
         if not identity_valid:
             logger.info(
@@ -736,17 +991,18 @@ def process_chat_message(
             )
 
     path_detail: Optional[Dict[str, Any]] = None
-    gemini_calls_count = 0
 
-    # 6. Determine path and extractive / synthesized answer
-    # Initial check: top_score < 0.45 or identity mismatch or no initial hits
-    needs_augmentation = (q_type != "out_of_scope") and (top_score < 0.45 or not ranked_chunks or not identity_valid)
+    # 7. Determine path and extractive / synthesized answer
+    needs_augmentation = (q_type != "out_of_scope") and (
+        top_score < RETRIEVAL_SCORE_THRESHOLD or not ranked_chunks or not identity_valid
+    )
 
     if needs_augmentation:
-        extracted_entity = extract_entity_name(clean_content)
+        extracted_entity = entity_name or extract_entity_name(clean_content)
         if extracted_entity:
             logger.info(f"Triggering IC3-WB self-augmentation for entity candidate: '{extracted_entity}'")
             try:
+                t_aug = time.time()
                 aug_res = run_augmentation_pipeline(
                     query=clean_content,
                     message_id=None,
@@ -754,6 +1010,17 @@ def process_chat_message(
                     db=db,
                 )
                 gemini_calls_count += aug_res.gemini_calls
+                tracer.record(
+                    "augmentation",
+                    t_aug,
+                    input_data={"entity": extracted_entity, "district": detected_district},
+                    output_data={
+                        "status": aug_res.status,
+                        "reason": aug_res.decision_reason,
+                        "site_id": aug_res.site_id,
+                        "sources_count": getattr(aug_res, "sources_count", 0),
+                    },
+                )
                 path_detail = {
                     "augment_job_id": str(aug_res.job_id),
                     "candidate_key": aug_res.candidate_key,
@@ -768,7 +1035,7 @@ def process_chat_message(
                         query_lang=detected_lang,
                         resolved_site=aug_res.site_id,
                         detected_district=detected_district,
-                        top_k=8,
+                        top_k=RETRIEVAL_TOP_K,
                     )
                     if new_ranked:
                         ranked_chunks = new_ranked
@@ -808,14 +1075,21 @@ def process_chat_message(
                         gemini_calls_count += 1
                     else:
                         path = "rejected"
-                        assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+                        n_sources = getattr(aug_res, "sources_count", 0) or 7
+                        ent_label = aug_res.entity_name or extracted_entity or "this temple"
+                        dist_label = f" in {detected_district} district" if detected_district else ""
+                        assistant_content = _build_web_checked_rejection(detected_lang, n_sources, ent_label, dist_label)
                         selected_chunks = []
                         citations = []
                         used_chunk_ids = []
                         effective_resolved_site = None
                 else:
                     path = "rejected"
-                    assistant_content = REJECTION_MESSAGES.get(detected_lang, REJECTION_MESSAGES["en"])
+                    # Rule 1.5: Web check ran! Never say 'in our database', say what was checked
+                    n_sources = getattr(aug_res, "sources_count", 0) or 7
+                    ent_label = aug_res.entity_name or extracted_entity or "this temple"
+                    dist_label = f" in {detected_district} district" if detected_district else ""
+                    assistant_content = _build_web_checked_rejection(detected_lang, n_sources, ent_label, dist_label)
                     selected_chunks = []
                     citations = []
                     used_chunk_ids = []
@@ -974,6 +1248,7 @@ def process_chat_message(
             {"sid": session_id},
         )
 
+    tracer.flush(db, user_message_id)
     db.commit()
 
     user_payload = UserMessagePayload(

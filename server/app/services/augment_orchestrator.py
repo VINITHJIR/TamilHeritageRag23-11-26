@@ -60,6 +60,7 @@ class AugmentResult:
     gemini_calls: int = 0
     gemini_tokens: int = 0
     latency_ms: int = 0
+    sources_count: int = 0
 
 
 def normalize_candidate_key(entity_name: str, district_id: Optional[int]) -> str:
@@ -580,6 +581,7 @@ def run_augmentation_pipeline(
             gemini_calls=gemini_calls,
             gemini_tokens=gemini_tokens,
             latency_ms=latency_ms,
+            sources_count=len(candidate_urls) if 'candidate_urls' in locals() and candidate_urls else 0,
         )
 
     except Exception as e:

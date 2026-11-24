@@ -44,7 +44,7 @@ qdrant_data/
 # HuggingFace & PyTorch model cache
 .cache/
 hf_cache/
-models/
+/models/
 
 # Node & Frontend
 node_modules/

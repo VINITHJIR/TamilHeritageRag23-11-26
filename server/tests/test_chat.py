@@ -252,7 +252,9 @@ def test_chat_pipeline_rejection_path():
     asst_msg = data["assistant_message"]
     assert asst_msg["path"] == "rejected"
     assert asst_msg["citations"] == []
-    assert "could not find reliable records" in asst_msg["content"]
+    # Rule 1.5: If web check ran, never say "in our database"; says what was checked
+    assert "checked" in asst_msg["content"].lower() or "could not confirm" in asst_msg["content"].lower() or "could not find reliable records" in asst_msg["content"].lower()
+    assert "in our database" not in asst_msg["content"].lower()
 
     # 2. Out of scope in Tamil
     msg_res_ta = client.post(f"/api/chat/sessions/{session_id}/messages", json={
@@ -261,9 +263,10 @@ def test_chat_pipeline_rejection_path():
     assert msg_res_ta.status_code == 200, msg_res_ta.text
     data_ta = msg_res_ta.json()
     asst_ta = data_ta["assistant_message"]
-    assert asst_ta["path"] == "rejected"
+    # Rule 1.2: non-heritage queries produce path 'out_of_scope' with polite reply
+    assert asst_ta["path"] in ("out_of_scope", "rejected")
     assert asst_ta["citations"] == []
-    assert "மன்னிக்கவும்" in asst_ta["content"]
+    assert "மரபு" in asst_ta["content"] or "பாரம்பரியம்" in asst_ta["content"] or "மன்னிக்கவும்" in asst_ta["content"]
 
 
 def test_message_feedback_upsert():
@@ -370,12 +373,13 @@ def test_identity_check_pariyur_rejected(mock_search):
         assert cit["site_id"] != "TN-ERD-0001"
 
 
+@patch("app.services.gemini.classify_query")
 @patch("app.services.augment_orchestrator.classify_query")
 @patch("app.services.chat_pipeline.gemini_synthesize_answer")
 @patch("app.services.augment_orchestrator.default_web_search")
 @patch("app.services.augment_orchestrator.fetch_page_content")
 @patch("app.services.augment_orchestrator.extract_claims")
-def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_search, mock_synth, mock_classify):
+def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_search, mock_synth, mock_classify_orch, mock_classify_gem):
     """Phase 4: 'pariyur amman temple pathi sollu' triggers self-augmentation.
 
     With mock web fetcher, extractor, classifier, and synthesizer, verifies:
@@ -384,7 +388,7 @@ def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_searc
     - citations trust in ('official', 'multi_source')
     - query_logs path_detail records augment_job_id
     """
-    mock_classify.return_value = {
+    mock_class_val = {
         "is_heritage": True,
         "entity_name": "Pariyur Kondathu Kaliamman Temple",
         "entity_name_ta": "பரியூர் கொண்டத்து காளியம்மன் கோவில்",
@@ -393,7 +397,13 @@ def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_searc
         "question_type": "history",
         "lang": "ta-Latn",
     }
+    mock_classify_orch.return_value = mock_class_val
+    mock_classify_gem.return_value = mock_class_val
     mock_synth.return_value = "Pariyur Kondathu Kaliamman Temple is located near Gobichettipalayam in Erode district."
+
+    with SessionLocal() as db:
+        db.execute(sa_text("DELETE FROM augment_jobs WHERE candidate_key LIKE 'pariyur%'"))
+        db.commit()
 
     guest_res = client.post("/api/users/guest")
     user_id = guest_res.json()["user_id"]

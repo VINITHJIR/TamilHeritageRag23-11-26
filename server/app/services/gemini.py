@@ -14,6 +14,7 @@ import httpx
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 from app.core.config import settings
+from app.services.spec_config import GEMINI_CLASSIFY_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ def _call_gemini_api(
     model: Optional[str] = None,
     api_key: Optional[str] = None,
     max_retries: int = 3,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Call the Google Gemini REST API with exponential backoff on 429/503.
 
@@ -71,10 +73,11 @@ def _call_gemini_api(
 
     backoff = 1.0
     start_time = time.time()
+    req_timeout = timeout or settings.GEMINI_TIMEOUT_SEC
 
     for attempt in range(1, max_retries + 1):
         try:
-            with httpx.Client(timeout=settings.GEMINI_TIMEOUT_SEC) as client:
+            with httpx.Client(timeout=req_timeout) as client:
                 res = client.post(url, json=body, headers=headers)
 
                 if res.status_code in (429, 503):
@@ -139,107 +142,168 @@ def _call_gemini_api(
 # -----------------------------------------------------------------------------
 # 1. Query Classification
 # -----------------------------------------------------------------------------
-def classify_query(text: str, db: Optional[Session] = None) -> Dict[str, Any]:
-    """Classify user query into heritage intent, entity, place, district, question type, and language.
-
-    Returns dict with keys:
-      is_heritage: bool
-      entity_name: Optional[str]
-      entity_name_ta: Optional[str]
-      place_name: Optional[str]
-      district_id: Optional[int]
-      question_type: str
-      lang: str
-    """
+def _rule_based_classify(clean_text: str, db: Optional[Session] = None) -> Dict[str, Any]:
+    """Deterministic rule-based fallback when Gemini classification fails or times out."""
     from app.services.chat_pipeline import (
         classify_question_type as rule_classify_question_type,
         detect_language as rule_detect_language,
         extract_entity_name as rule_extract_entity_name,
     )
+    from app.services.place_resolution import resolve_place
 
+    lang = rule_detect_language(clean_text)
+    q_type = rule_classify_question_type(clean_text)
+
+    # Check non-heritage patterns
+    non_heritage_patterns = [
+        r"what\s+is\s+(?:ur|your)\s+name",
+        r"who\s+are\s+you",
+        r"tell\s+me\s+a\s+joke",
+        r"how\s+are\s+you",
+        r"weather", r"cricket", r"bitcoin", r"crypto", r"election"
+    ]
+    if any(re.search(pat, clean_text, re.IGNORECASE) for pat in non_heritage_patterns):
+        q_type = "out_of_scope"
+
+    is_heritage = (q_type != "out_of_scope")
+    entity = rule_extract_entity_name(clean_text) if is_heritage else None
+
+    # Resolve place
+    res_place = resolve_place(clean_text, None, db=db)
+    place_name = res_place.matched_term
+    district_id = res_place.district_id
+
+    # Determine entity_type: specific_site | deity_or_generic_name | region_or_list | concept
+    entity_type = "specific_site"
+    generic_deity_names = ["ponniamman", "mariamman", "ayyanar", "kaliamman", "vinayagar", "murugan", "muniswaran", "karuppasamy", "masani amman"]
+    if entity and any(d in entity.lower() for d in generic_deity_names) and not place_name:
+        entity_type = "deity_or_generic_name"
+    elif not entity:
+        entity_type = "concept"
+
+    # Determine asked_field
+    asked_field = "overview"
+    if q_type == "history":
+        asked_field = "builder" if any(w in clean_text.lower() for w in ["who built", "builder", "kattiyavar"]) else "built_year"
+    elif q_type == "location":
+        asked_field = "location"
+    elif q_type == "timings_entry":
+        asked_field = "timings"
+    elif q_type == "festival":
+        asked_field = "festivals"
+    elif q_type == "architecture":
+        asked_field = "architecture_style"
+
+    final_q_type = q_type or ("out_of_scope" if not is_heritage else "general_heritage")
+
+    return {
+        "is_heritage": is_heritage,
+        "entity_name": entity,
+        "entity_name_ta": None,
+        "place_name": place_name,
+        "district_id": district_id,
+        "entity_type": entity_type,
+        "asked_field": asked_field,
+        "question_type": final_q_type,
+        "lang": lang,
+        "fallback_used": True,
+    }
+
+
+def classify_query(
+    text: str,
+    db: Optional[Session] = None,
+    timeout_sec: float = GEMINI_CLASSIFY_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    """Classify user query into heritage intent, entity, place, district, question type, and language.
+
+    Rule 1.1: Returns dict with keys:
+      is_heritage: bool
+      lang: str
+      question_type: str (never empty)
+      entity_name: Optional[str]
+      entity_name_ta: Optional[str]
+      place_name: Optional[str]
+      entity_type: str ('specific_site' | 'deity_or_generic_name' | 'region_or_list' | 'concept')
+      asked_field: Optional[str]
+      district_id: Optional[int]
+      fallback_used: bool
+    """
     clean_text = text.strip()
 
-    # If GEMINI_API_KEY is not configured or in unit test mode without key, fallback to rule-based
+    # If GEMINI_API_KEY is not configured, fallback immediately
     if not settings.GEMINI_API_KEY:
-        lang = rule_detect_language(clean_text)
-        q_type = rule_classify_question_type(clean_text)
-        entity = rule_extract_entity_name(clean_text)
-        is_heritage = q_type != "out_of_scope"
-
-        district_id = None
-        if db and entity:
-            dist_row = db.execute(
-                sa_text("SELECT location_id FROM locations WHERE level = 'district' AND lower(name_en) = lower(:p)"),
-                {"p": entity},
-            ).fetchone()
-            if dist_row:
-                district_id = dist_row[0]
-
-        return {
-            "is_heritage": is_heritage,
-            "entity_name": entity,
-            "entity_name_ta": None,
-            "place_name": None,
-            "district_id": district_id,
-            "question_type": q_type,
-            "lang": lang,
-        }
+        return _rule_based_classify(clean_text, db=db)
 
     system_inst = (
-        "You are an expert NLP classifier for Tamil Nadu heritage queries. "
+        "You are an expert NLP classifier for Tamil Nadu heritage queries.\n"
         "Analyze the user's question and output a single JSON object with the following fields:\n"
-        "- is_heritage (boolean): whether the question is about Tamil Nadu heritage, monuments, temples, history, etc.\n"
-        "- entity_name (string or null): the specific monument/temple/fort in English (e.g. 'Pariyur Kondathu Kaliamman Temple')\n"
+        "- is_heritage (boolean): whether the question is about Tamil Nadu heritage, monuments, temples, history, culture, etc. "
+        "Set to false for non-heritage queries like greetings ('hi', 'hello'), general bot questions ('what is ur name', 'who are you'), chit-chat, weather, sports, politics, math, or coding.\n"
+        "- entity_name (string or null): specific monument/temple/fort in English (e.g. 'Pariyur Kondathu Kaliamman Temple')\n"
         "- entity_name_ta (string or null): entity name in Tamil script if available\n"
-        "- place_name (string or null): town, village, or district mentioned\n"
-        "- question_type (string): one of [history, architecture, location, how_to_reach, timings_entry, festival, recommendation, comparison, out_of_scope, general_heritage]\n"
+        "- place_name (string or null): town, village, or district mentioned (e.g. 'Pollachi', 'Erode')\n"
+        "- entity_type (string): one of ['specific_site', 'deity_or_generic_name', 'region_or_list', 'concept'].\n"
+        "  Few-shot rules:\n"
+        "  * 'ponniamman temple' without a place -> deity_or_generic_name\n"
+        "  * 'mariamman kovil' without a place -> deity_or_generic_name\n"
+        "  * 'ayyanar temple' without a place -> deity_or_generic_name\n"
+        "  * 'masani amman temple' without a place -> deity_or_generic_name\n"
+        "  * 'masani amman temple at pollachi' -> specific_site\n"
+        "  * 'madurai meenakshi' -> specific_site\n"
+        "  * 'temples in Madurai' -> region_or_list\n"
+        "  * 'dravidian architecture' -> concept\n"
+        "- asked_field (string or null): attribute asked about, e.g. 'built_year', 'builder', 'location', 'timings', 'festivals', 'overview', 'architecture'\n"
+        "- question_type (string): one of [history, architecture, location, how_to_reach, timings_entry, festival, recommendation, comparison, out_of_scope, general_heritage]. MUST NOT be empty.\n"
         "- lang (string): 'ta' (Tamil script), 'kn' (Kannada script), 'ta-Latn' (Tanglish/Tamil transliterated in Latin script), or 'en' (English)\n"
         "Return ONLY the raw JSON object."
     )
 
     try:
-        call_res = _call_gemini_api(clean_text, system_instruction=system_inst, json_response=True)
+        call_res = _call_gemini_api(
+            clean_text,
+            system_instruction=system_inst,
+            json_response=True,
+            timeout=timeout_sec,
+        )
         raw_json = json.loads(call_res["text"])
+
+        is_heritage = bool(raw_json.get("is_heritage", True))
+        q_type = raw_json.get("question_type") or ("out_of_scope" if not is_heritage else "general_heritage")
+        if not is_heritage:
+            q_type = "out_of_scope"
+
+        entity_type = raw_json.get("entity_type") or ("concept" if not raw_json.get("entity_name") else "specific_site")
+        if entity_type not in {"specific_site", "deity_or_generic_name", "region_or_list", "concept"}:
+            entity_type = "specific_site"
 
         entity_name = raw_json.get("entity_name")
         place_name = raw_json.get("place_name")
         district_id = None
 
-        if db and place_name:
-            dist_row = db.execute(
-                sa_text("""
-                    SELECT location_id FROM locations
-                    WHERE level = 'district'
-                      AND (lower(name_en) = lower(:p) OR lower(name_ta) = lower(:p))
-                """),
-                {"p": place_name.strip()},
-            ).fetchone()
-            if dist_row:
-                district_id = dist_row[0]
+        if db and (place_name or clean_text):
+            from app.services.place_resolution import resolve_place
+            res_place = resolve_place(clean_text, place_name, db=db)
+            district_id = res_place.district_id
+            if res_place.matched_term and not place_name:
+                place_name = res_place.matched_term
 
+        from app.services.chat_pipeline import detect_language as rule_detect_language
         return {
-            "is_heritage": bool(raw_json.get("is_heritage", True)),
+            "is_heritage": is_heritage,
             "entity_name": entity_name,
             "entity_name_ta": raw_json.get("entity_name_ta"),
             "place_name": place_name,
             "district_id": district_id,
-            "question_type": raw_json.get("question_type", "general_heritage"),
-            "lang": raw_json.get("lang", rule_detect_language(clean_text)),
+            "entity_type": entity_type,
+            "asked_field": raw_json.get("asked_field") or "overview",
+            "question_type": q_type,
+            "lang": raw_json.get("lang") or rule_detect_language(clean_text),
+            "fallback_used": False,
         }
     except Exception as e:
-        logger.warning(f"Gemini query classification failed ({e}), falling back to rule-based classifier.")
-        lang = rule_detect_language(clean_text)
-        q_type = rule_classify_question_type(clean_text)
-        entity = rule_extract_entity_name(clean_text)
-        return {
-            "is_heritage": q_type != "out_of_scope",
-            "entity_name": entity,
-            "entity_name_ta": None,
-            "place_name": None,
-            "district_id": None,
-            "question_type": q_type,
-            "lang": lang,
-        }
+        logger.warning(f"Gemini query classification failed or timed out ({e}), falling back to rule-based classifier.")
+        return _rule_based_classify(clean_text, db=db)
 
 
 # -----------------------------------------------------------------------------
