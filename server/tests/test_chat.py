@@ -402,6 +402,18 @@ def test_pariyur_augmentation_web_consensus(mock_extract, mock_fetch, mock_searc
     mock_synth.return_value = "Pariyur Kondathu Kaliamman Temple is located near Gobichettipalayam in Erode district."
 
     with SessionLocal() as db:
+        old_sites = db.execute(sa_text("SELECT site_id FROM sites WHERE name_en ILIKE '%pariyur%'")).fetchall()
+        for os in old_sites:
+            sid = os[0]
+            db.execute(sa_text("UPDATE chat_messages SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": sid})
+            db.execute(sa_text("UPDATE query_logs SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM site_aliases WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM field_decisions WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM evidence_ledger WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM site_facts WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM chunk_registry WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM augment_jobs WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM sites WHERE site_id = :sid"), {"sid": sid})
         db.execute(sa_text("DELETE FROM augment_jobs WHERE candidate_key LIKE 'pariyur%'"))
         db.commit()
 

@@ -38,15 +38,18 @@ from app.services.fact_consensus import (
     normalize_fact_value,
 )
 from app.services.gemini import classify_query, extract_claims
-from app.services.spec_config import DecisionCode
+from app.services.spec_config import (
+    DecisionCode,
+    CONSENSUS_FIELDS,
+    EXISTENCE_MIN_TIER_A_CLUSTERS,
+    EXISTENCE_MIN_INDEPENDENT_CLUSTERS,
+)
 from app.services.writeback import check_writeback_gate, execute_writeback
 
 logger = logging.getLogger(__name__)
 
-TARGET_FIELDS = [
-    "name_en", "name_ta", "primary_category", "district_id",
-    "overview", "history", "builder", "period", "dynasty", "built_year", "deity"
-]
+# Rule 3.4: Extracted claim fields subject to consensus (overview and history are NOT consensus fields)
+TARGET_FIELDS = CONSENSUS_FIELDS
 
 
 @dataclass
@@ -81,6 +84,98 @@ def strip_html_tags(html_content: str) -> str:
     # Unescape HTML entities
     cleaned = cleaned.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def check_existence(
+    clustered_sources: List[Dict[str, Any]],
+    entity_name: str,
+    entity_name_ta: Optional[str] = None,
+    district_name: Optional[str] = None,
+    place_name: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Rule 3.2: check_existence: ACCEPTED iff:
+    - (>= 1 tier-A cluster whose pages mention the entity AND the district/place)
+    - OR (>= 3 independent clusters whose pages mention the entity AND the district/place).
+    Mentions checked on fetched text (aliases, Tamil/Latin folding, district/place aliases).
+    """
+    if not clustered_sources:
+        return (False, DecisionCode.EXISTENCE_NOT_CONFIRMED.value, {"tier_a_clusters": 0, "independent_clusters": 0})
+
+    place_terms: Set[str] = set()
+    if district_name:
+        place_terms.add(district_name.lower().strip())
+    if place_name:
+        place_terms.add(place_name.lower().strip())
+
+    if db and district_name:
+        try:
+            d_rows = db.execute(
+                sa_text("SELECT name_en, name_ta FROM locations WHERE level = 'district' AND (lower(name_en) = lower(:d) OR :d ILIKE '%' || name_en || '%')"),
+                {"d": district_name.strip()},
+            ).fetchall()
+            for r in d_rows:
+                if r[0]:
+                    place_terms.add(r[0].lower().strip())
+                if r[1]:
+                    place_terms.add(r[1].lower().strip())
+        except Exception:
+            pass
+
+    clusters: Dict[str, List[Dict[str, Any]]] = {}
+    for src in clustered_sources:
+        ck = src.get("cluster_key") or src.get("domain") or "default_cluster"
+        clusters.setdefault(ck, []).append(src)
+
+    confirming_clusters: Set[str] = set()
+    tier_a_confirming_clusters: Set[str] = set()
+
+    for ck, pages in clusters.items():
+        cluster_confirms = False
+        cluster_has_tier_a = False
+
+        for page in pages:
+            text = page.get("text", "")
+            if not text:
+                continue
+
+            mentions_ent = page_mentions_entity(text, entity_name)
+            if not mentions_ent and entity_name_ta and entity_name_ta in text:
+                mentions_ent = True
+
+            text_lower = text.lower()
+            mentions_pl = False
+            for term in place_terms:
+                if len(term) >= 3 and term in text_lower:
+                    mentions_pl = True
+                    break
+
+            if not place_terms:
+                mentions_pl = True
+
+            if mentions_ent and mentions_pl:
+                cluster_confirms = True
+                if str(page.get("tier", "C")).upper() == "A":
+                    cluster_has_tier_a = True
+
+        if cluster_confirms:
+            confirming_clusters.add(ck)
+            if cluster_has_tier_a:
+                tier_a_confirming_clusters.add(ck)
+
+    n_tier_a = len(tier_a_confirming_clusters)
+    n_independent = len(confirming_clusters)
+    debug_info = {
+        "tier_a_clusters": n_tier_a,
+        "independent_clusters": n_independent,
+        "confirming_cluster_keys": list(confirming_clusters),
+    }
+
+    accepted = (n_tier_a >= EXISTENCE_MIN_TIER_A_CLUSTERS) or (n_independent >= EXISTENCE_MIN_INDEPENDENT_CLUSTERS)
+    if accepted:
+        return (True, "ACCEPTED", debug_info)
+    else:
+        return (False, DecisionCode.EXISTENCE_NOT_CONFIRMED.value, debug_info)
 
 
 # -----------------------------------------------------------------------------
@@ -257,6 +352,7 @@ def run_augmentation_pipeline(
         entity_name_ta = classification.get("entity_name_ta")
         place_name = classification.get("place_name")
         district_id = classification.get("district_id")
+        primary_category = classification.get("primary_category")
         is_heritage = classification.get("is_heritage", True)
 
         if not is_heritage or not entity_name:
@@ -410,6 +506,25 @@ def run_augmentation_pipeline(
         # Filter relevant sources mentioning entity
         relevant_sources = [s for s in clustered_sources if s["mentions_entity"]]
 
+        # Rule 3.2: Existence Check
+        resolved_dist_name = None
+        if district_id:
+            d_row = db.execute(sa_text("SELECT name_en FROM locations WHERE location_id = :lid"), {"lid": district_id}).fetchone()
+            if d_row:
+                resolved_dist_name = d_row[0]
+        if not resolved_dist_name and place_name:
+            resolved_dist_name = place_name
+
+        existence_accepted, existence_reason, existence_info = check_existence(
+            clustered_sources=clustered_sources,
+            entity_name=entity_name,
+            entity_name_ta=entity_name_ta,
+            district_name=resolved_dist_name,
+            place_name=place_name,
+            db=db,
+        )
+        logger.info(f"Existence check for '{entity_name}' in '{resolved_dist_name}': accepted={existence_accepted} ({existence_info})")
+
         # Persist augment_sources
         for src in clustered_sources:
             is_used = src in relevant_sources[:5]
@@ -497,32 +612,18 @@ def run_augmentation_pipeline(
                 )
         db.commit()
 
-        # 7. Consensus Evaluation
+        # 7. Consensus Evaluation (Rule 3.3, 3.4)
         decisions: Dict[str, FieldDecisionResult] = {}
         for f_name in TARGET_FIELDS:
             f_claims = [c for c in all_extracted_claims if c["field"] == f_name]
             dec = evaluate_field_consensus(f_name, f_claims)
             decisions[f_name] = dec
 
-        # Inject entity_name if supported by query/classification
-        if decisions.get("name_en") is None or decisions["name_en"].decision != "verified":
-            decisions["name_en"] = FieldDecisionResult(
-                field="name_en",
-                decision="verified",
-                value=entity_name,
-                support=2.0,
-                n_clusters=2,
-                has_tier_a=False,
-                rule_fired="verified_user_entity_anchor",
-            )
-
         # Resolve district_id from decisions, classification, or place_name
-        if decisions.get("district_id") is None or decisions["district_id"].decision != "verified":
+        if district_id is None:
             dist_val = None
             if decisions.get("district") and decisions["district"].value:
                 dist_val = decisions["district"].value
-            elif district_id:
-                dist_val = str(district_id)
             elif place_name:
                 dist_val = place_name
 
@@ -536,39 +637,38 @@ def run_augmentation_pipeline(
                     {"p": str(dist_val).strip()},
                 ).fetchone()
                 if dist_row:
-                    decisions["district_id"] = FieldDecisionResult(
-                        field="district_id",
-                        decision="verified",
-                        value=str(dist_row[0]),
-                        support=2.0,
-                        n_clusters=2,
-                        has_tier_a=False,
-                        rule_fired="verified_district_resolution",
-                    )
+                    district_id = dist_row[0]
 
-        # 8. Write-back Gating & Execution
+        # 8. Write-back Gating & Execution (Rules 3.5 - 3.8)
         allocated_site_id = execute_writeback(
             db=db,
             job_id=job_id,
             decisions=decisions,
             candidate_key=candidate_key,
+            existence_accepted=existence_accepted,
+            district_id=district_id,
+            entity_name=entity_name,
+            primary_category=primary_category,
+            source_id=None,
+            relevant_sources=relevant_sources,
         )
 
-        verified_map = {
-            f_name: dec.value for f_name, dec in decisions.items()
-            if dec.decision == "verified" and dec.value
-        }
-
-        gate_passed, reason = check_writeback_gate(decisions)
         if allocated_site_id:
             final_status = "verified"
             decision_code = DecisionCode.VERIFIED_NEW.value
-        elif not verified_map:
-            final_status = "rejected_nonexistent"
-            decision_code = DecisionCode.EXISTENCE_NOT_CONFIRMED.value
+        elif not existence_accepted:
+            has_quote_verified = any(c.get("quote_found") for c in all_extracted_claims)
+            if has_quote_verified and relevant_sources:
+                final_status = "provisional"
+                decision_code = DecisionCode.PROVISIONAL_PARTIAL_EVIDENCE.value
+            else:
+                final_status = "rejected_nonexistent"
+                decision_code = DecisionCode.EXISTENCE_NOT_CONFIRMED.value
         else:
             final_status = "failed"
-            decision_code = reason
+            decision_code = DecisionCode.EXCEPTION.value
+
+        verified_map = {f: d.value for f, d in decisions.items() if d.decision == "verified" and d.value}
         latency_ms = int((time.time() - start_time) * 1000)
 
         # 9. Update augment_jobs execution statistics

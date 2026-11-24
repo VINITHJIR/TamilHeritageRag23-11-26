@@ -135,6 +135,21 @@ def test_e2e_self_augmentation_lifecycle(mock_extract, mock_fetch, mock_search, 
         ).fetchone()
         district_id = dist_row[0] if dist_row else 30
 
+        old_sites = db.execute(sa_text("SELECT site_id FROM sites WHERE name_en ILIKE :pat"), {"pat": f"%{entity_name}%"}).fetchall()
+        for os in old_sites:
+            sid = os[0]
+            db.execute(sa_text("UPDATE chat_messages SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": sid})
+            db.execute(sa_text("UPDATE query_logs SET resolved_site = NULL WHERE resolved_site = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM site_aliases WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM field_decisions WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM evidence_ledger WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM site_facts WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM chunk_registry WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM augment_jobs WHERE site_id = :sid"), {"sid": sid})
+            db.execute(sa_text("DELETE FROM sites WHERE site_id = :sid"), {"sid": sid})
+        db.execute(sa_text("DELETE FROM augment_jobs WHERE candidate_key LIKE 'annamalaiyar%'"))
+        db.commit()
+
     mock_classify.return_value = {
         "is_heritage": True,
         "entity_name": entity_name,

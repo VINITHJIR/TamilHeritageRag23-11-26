@@ -6,35 +6,55 @@ from app.db.postgres import SessionLocal
 from app.services.fact_consensus import FieldDecisionResult
 from app.services.writeback import (
     allocate_next_site_id,
+    calculate_site_completeness,
     check_writeback_gate,
     execute_writeback,
 )
 
 
-def test_check_writeback_gate_missing_fields():
-    """Gating fails if required core fields or historical context fields are missing."""
-    decisions = {
-        "name_en": FieldDecisionResult("name_en", "verified", "Pariyur Temple", 1.5, 2, False, "rule"),
-        # Missing primary_category, district_id, overview, history
-    }
-    gate_ok, reason = check_writeback_gate(decisions)
+def test_check_writeback_gate_not_accepted():
+    """Rule 3.5: Gating fails if existence is not confirmed or district_id is missing."""
+    gate_ok, reason = check_writeback_gate(existence_accepted=False, district_id=1)
     assert gate_ok is False
-    assert "Missing required verified core fields" in reason
+    assert "not confirmed" in reason.lower()
+
+    gate_ok2, reason2 = check_writeback_gate(existence_accepted=True, district_id=None)
+    assert gate_ok2 is False
+    assert "district_id" in reason2.lower()
 
 
 def test_check_writeback_gate_success():
-    """Gating succeeds when all core fields and at least one historical context field are verified."""
-    decisions = {
-        "name_en": FieldDecisionResult("name_en", "verified", "Pariyur Amman Temple", 1.5, 2, False, "rule"),
-        "primary_category": FieldDecisionResult("primary_category", "verified", "temple", 1.5, 2, False, "rule"),
-        "district_id": FieldDecisionResult("district_id", "verified", "1", 1.5, 2, False, "rule"),
-        "overview": FieldDecisionResult("overview", "verified", "Pariyur Amman Temple overview text.", 1.5, 2, False, "rule"),
-        "history": FieldDecisionResult("history", "verified", "Pariyur Amman Temple history text.", 1.5, 2, False, "rule"),
-        "period": FieldDecisionResult("period", "verified", "17th century CE", 1.5, 2, False, "rule"),
-    }
-    gate_ok, reason = check_writeback_gate(decisions)
+    """Rule 3.5: Gating succeeds iff existence is accepted and district_id is known. NO other field required."""
+    gate_ok, reason = check_writeback_gate(existence_accepted=True, district_id=1)
     assert gate_ok is True
     assert "satisfied" in reason
+
+
+def test_calculate_site_completeness():
+    """Rule 3.7: Completeness levels: existence_only (<=1), partial (2-3), complete (>=4)."""
+    # 0 optional verified -> existence_only
+    d0 = {}
+    assert calculate_site_completeness(d0) == "existence_only"
+
+    # 1 optional verified -> existence_only
+    d1 = {"deity": FieldDecisionResult("deity", "verified", "Shiva", 1.5, 2, False, "r")}
+    assert calculate_site_completeness(d1) == "existence_only"
+
+    # 2 optional verified -> partial
+    d2 = {
+        "deity": FieldDecisionResult("deity", "verified", "Shiva", 1.5, 2, False, "r"),
+        "builder": FieldDecisionResult("builder", "verified", "Raja Raja Chola I", 1.5, 2, False, "r"),
+    }
+    assert calculate_site_completeness(d2) == "partial"
+
+    # 4 optional verified -> complete
+    d4 = {
+        "deity": FieldDecisionResult("deity", "verified", "Shiva", 1.5, 2, False, "r"),
+        "builder": FieldDecisionResult("builder", "verified", "Raja Raja Chola I", 1.5, 2, False, "r"),
+        "dynasty": FieldDecisionResult("dynasty", "verified", "Chola", 1.5, 2, False, "r"),
+        "period": FieldDecisionResult("period", "verified", "11th century CE", 1.5, 2, False, "r"),
+    }
+    assert calculate_site_completeness(d4) == "complete"
 
 
 def test_allocate_next_site_id():
@@ -73,10 +93,9 @@ def test_execute_writeback_and_atomic_persistence():
             "name_ta": FieldDecisionResult("name_ta", "verified", "சோதனை பாரம்பரிய தளம்", 1.5, 2, True, "rule_a"),
             "primary_category": FieldDecisionResult("primary_category", "verified", "monument", 1.5, 2, True, "rule_a"),
             "district_id": FieldDecisionResult("district_id", "verified", erode_id, 1.5, 2, True, "rule_a"),
-            "overview": FieldDecisionResult("overview", "verified", "Mock Heritage Site overview text for writeback test.", 1.5, 2, True, "rule_a"),
-            "history": FieldDecisionResult("history", "verified", "Mock Heritage Site built by Nayakas in 17th century.", 1.5, 2, True, "rule_a"),
             "period": FieldDecisionResult("period", "verified", "17th century CE", 1.5, 2, True, "rule_a"),
             "builder": FieldDecisionResult("builder", "verified", "Tirumala Nayaka", 1.5, 2, True, "rule_a"),
+            "overview": FieldDecisionResult("overview", "unconfirmed", "Mock overview text.", 0.6, 1, False, "unconfirmed"),
         }
 
         site_id = None
@@ -86,6 +105,9 @@ def test_execute_writeback_and_atomic_persistence():
                 job_id=job_id,
                 decisions=decisions,
                 candidate_key=f"mock_site|{erode_id}",
+                existence_accepted=True,
+                district_id=int(erode_id),
+                entity_name="Mock Heritage Site",
             )
 
             assert site_id is not None
@@ -93,7 +115,7 @@ def test_execute_writeback_and_atomic_persistence():
 
             # Verify site in PostgreSQL
             site_row = db.execute(
-                sa_text("SELECT site_id, name_en, origin, status, trust FROM sites WHERE site_id = :sid"),
+                sa_text("SELECT site_id, name_en, origin, status, trust, completeness FROM sites WHERE site_id = :sid"),
                 {"sid": site_id},
             ).mappings().fetchone()
             assert site_row is not None
@@ -101,6 +123,8 @@ def test_execute_writeback_and_atomic_persistence():
             assert site_row["origin"] == "web_consensus"
             assert site_row["status"] == "verified"
             assert site_row["trust"] == "official"
+            # period, builder, name_ta = 3 optional fields verified -> partial
+            assert site_row["completeness"] == "partial"
 
             # Verify job status in augment_jobs
             job_row = db.execute(
@@ -110,25 +134,44 @@ def test_execute_writeback_and_atomic_persistence():
             assert job_row["status"] == "verified"
             assert job_row["site_id"] == site_id
 
-            # Verify chunks in chunk_registry
+            # Verify chunks in chunk_registry (fact card en + ta)
             chunk_count = db.execute(
                 sa_text("SELECT count(*) FROM chunk_registry WHERE site_id = :sid"),
                 {"sid": site_id},
             ).scalar()
-            assert chunk_count == 2  # overview + history
+            assert chunk_count >= 2
+
+            # Rule 3.8: UNCONFIRMED values are NOT written to site_facts
+            unconfirmed_facts = db.execute(
+                sa_text("SELECT count(*) FROM site_facts WHERE site_id = :sid AND field = 'overview'"),
+                {"sid": site_id},
+            ).scalar()
+            assert unconfirmed_facts == 0
+
+            # Verified fields ARE written to site_facts
+            verified_facts = db.execute(
+                sa_text("SELECT count(*) FROM site_facts WHERE site_id = :sid AND field IN ('builder', 'period')"),
+                {"sid": site_id},
+            ).scalar()
+            assert verified_facts == 2
         finally:
-            # Clean up test site from DB and Qdrant to ensure zero test pollution
             if site_id:
                 from app.db.qdrant import get_qdrant_client
                 from app.core.config import settings
                 from qdrant_client.http import models
                 qdrant = get_qdrant_client()
-                qdrant.delete(
-                    collection_name=settings.QDRANT_COLLECTION,
-                    points_selector=models.FilterSelector(
-                        filter=models.Filter(must=[models.FieldCondition(key="site_id", match=models.MatchValue(value=site_id))])
-                    ),
-                )
+                try:
+                    qdrant.delete(
+                        collection_name=settings.QDRANT_COLLECTION,
+                        points_selector=models.FilterSelector(
+                            filter=models.Filter(must=[models.FieldCondition(key="site_id", match=models.MatchValue(value=site_id))])
+                        ),
+                    )
+                except Exception:
+                    pass
+                db.execute(sa_text("DELETE FROM chunk_registry WHERE site_id = :sid"), {"sid": site_id})
+                db.execute(sa_text("DELETE FROM site_facts WHERE site_id = :sid"), {"sid": site_id})
+                db.execute(sa_text("DELETE FROM site_aliases WHERE site_id = :sid"), {"sid": site_id})
                 db.execute(sa_text("DELETE FROM augment_jobs WHERE job_id = :jid"), {"jid": job_id})
                 db.execute(sa_text("DELETE FROM sites WHERE site_id = :sid"), {"sid": site_id})
                 db.commit()

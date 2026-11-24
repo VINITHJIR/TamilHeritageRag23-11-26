@@ -78,7 +78,8 @@ def test_rule_2_2_reply_pollachi_resolves_clarification():
     assert res1.json()["assistant_message"]["path"] == "needs_clarification"
 
     # 2. Answer with "Pollachi"
-    res2 = client.post(f"/api/chat/sessions/{session_id}/messages", json={"content": "Pollachi"})
+    with patch("app.services.augment_orchestrator.default_web_search", return_value=[]):
+        res2 = client.post(f"/api/chat/sessions/{session_id}/messages", json={"content": "Pollachi"})
     assert res2.status_code == 200
     data2 = res2.json()
 

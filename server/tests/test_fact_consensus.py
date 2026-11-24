@@ -102,8 +102,9 @@ def test_copycat_discount():
     res = evaluate_field_consensus("dynasty", claims)
     # Since all 3 are from copycat_cluster_1, support should be 0.6, NOT 1.8!
     assert res.support == 0.6
-    assert res.decision == "rejected"
-    assert res.rule_fired == "rejected_insufficient_support"
+    # Rule 3.3: Single cluster with quote-verified evidence is UNCONFIRMED
+    assert res.decision == "unconfirmed"
+    assert res.rule_fired == "unconfirmed_partial_evidence"
 
 
 def test_conflict_detection():

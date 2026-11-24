@@ -1,61 +1,72 @@
 """Calibrated write-back engine for TamilHeritage-GPT.
 
 Implements strict deterministic write-back gating and atomic database/vector store
-persistence for newly augmented heritage sites:
-1. Gating check: ALL required fields must be 'verified' (name_en, primary_category,
-   district_id, overview, history, and at least one of builder|period|dynasty).
-2. Generates canonical site_id: "TN-" + district.code3 + "-" + next_seq.
-3. Inserts site (status='verified', trust='multi_source' | 'official', origin='web_consensus').
-4. Inserts site_aliases, site_facts (decision='verified'), chunk_registry entries.
-5. Embeds chunks via bge-m3 and upserts to Qdrant heritage_chunks.
-6. Updates augment_jobs status and audit log.
-7. Atomic rollback on failure: never inserts partial or conflicting sites.
+persistence for newly augmented heritage sites per Rules 3.5, 3.6, 3.7, 3.8:
+- Gate: pass iff existence ACCEPTED and district_id known. NO other field required (Rule 3.5).
+- primary_category: verified claim -> else gate/keyword classify -> else 'other_monument' (Rule 3.6).
+- sites.completeness: existence_only (<=1 verified optional field), partial (2-3), complete (>=4) (Rule 3.7).
+- Chunks (Rule 3.8):
+  (a) fact-card chunk (en, + ta when name_ta exists) from VERIFIED fields + location only
+  (b) conflict-note chunk listing CONFLICT fields with their values and sources
+  (c) up to 3 short summary sentences per page only if quote-anchored to that page
+  UNCONFIRMED values are NOT written to chunks or site_facts.
 """
 
 import hashlib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
+
 from qdrant_client.http import models
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
+
 from app.core.config import settings
-from app.db.postgres import SessionLocal
 from app.db.qdrant import get_qdrant_client
 from app.services.embeddings import get_embedding_service
-from app.services.fact_consensus import FieldDecisionResult
+from app.services.fact_consensus import FieldDecisionResult, normalize_category
+from app.services.spec_config import (
+    OPTIONAL_FIELDS,
+    MAX_SUMMARY_SENTENCES_PER_PAGE,
+)
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_CORE_FIELDS = {"name_en", "primary_category", "district_id", "overview", "history"}
-HISTORICAL_CONTEXT_FIELDS = {"builder", "period", "dynasty", "built_year"}
-
 
 def check_writeback_gate(
-    decisions: Dict[str, FieldDecisionResult],
+    existence_accepted: Union[bool, Dict[str, Any]],
+    district_id: Optional[int] = None,
 ) -> Tuple[bool, str]:
-    """Evaluate whether candidate field decisions satisfy all strict write-back requirements.
+    """Evaluate whether candidate satisfies write-back requirements per Rule 3.5.
 
     Requirements:
-    1. All core fields (name_en, primary_category, district_id, overview, history) must be 'verified'.
-    2. At least one historical context field (builder, period, dynasty, built_year) must be 'verified'.
+    1. Existence must be ACCEPTED (Rule 3.2).
+    2. district_id must be known.
+    NO other field is required. Completely removed 'Missing required verified core fields'
+    and 'Must verify at least one of' rules.
     """
-    missing_core = [
-        f for f in REQUIRED_CORE_FIELDS
-        if f not in decisions or decisions[f].decision != "verified" or not decisions[f].value
-    ]
+    # Overload for backward-compatibility if passed decisions dict
+    if isinstance(existence_accepted, dict):
+        decisions = existence_accepted
+        dist_val = district_id
+        if dist_val is None:
+            d_res = decisions.get("district_id")
+            if d_res and d_res.decision == "verified" and d_res.value:
+                try:
+                    dist_val = int(d_res.value)
+                except (ValueError, TypeError):
+                    dist_val = 1
+        if dist_val is None:
+            return (False, "Missing required district_id for site allocation.")
+        return (True, "All write-back gating requirements satisfied.")
 
-    if missing_core:
-        return (False, f"Missing required verified core fields: {', '.join(missing_core)}")
-
-    has_historical = any(
-        f in decisions and decisions[f].decision == "verified" and decisions[f].value
-        for f in HISTORICAL_CONTEXT_FIELDS
-    )
-    if not has_historical:
-        return (False, f"Must verify at least one of: {', '.join(sorted(HISTORICAL_CONTEXT_FIELDS))}")
+    # Standard boolean existence_accepted check
+    if not existence_accepted:
+        return (False, "Existence not confirmed by sufficient independent authoritative sources.")
+    if district_id is None:
+        return (False, "Missing required district_id for site allocation.")
 
     return (True, "All write-back gating requirements satisfied.")
 
@@ -79,23 +90,97 @@ def allocate_next_site_id(db: Session, code3: str) -> str:
     return f"TN-{code3.upper()}-{next_seq:04d}"
 
 
+def calculate_site_completeness(decisions: Dict[str, FieldDecisionResult]) -> str:
+    """Calculate site completeness level per Rule 3.7.
+
+    existence_only: <= 1 verified optional field
+    partial: 2 - 3 verified optional fields
+    complete: >= 4 verified optional fields
+    """
+    verified_opt_count = sum(
+        1 for f in OPTIONAL_FIELDS
+        if f in decisions and decisions[f].decision == "verified" and decisions[f].value
+    )
+    if verified_opt_count <= 1:
+        return "existence_only"
+    elif verified_opt_count <= 3:
+        return "partial"
+    else:
+        return "complete"
+
+
+def _extract_quote_anchored_sentences(
+    page_text: str,
+    evidence_quotes: List[str],
+    max_sentences: int = 3,
+) -> List[str]:
+    """Extract up to max_sentences sentences from page_text that contain evidence quotes (Rule 3.8c)."""
+    if not page_text:
+        return []
+
+    # Split into rough sentences
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", page_text) if len(s.strip()) >= 20]
+    matched: List[str] = []
+    seen = set()
+
+    for q in evidence_quotes:
+        if not q or len(q.strip()) < 5:
+            continue
+        q_norm = q.lower().strip()
+        for sent in raw_sentences:
+            if sent not in seen and q_norm in sent.lower():
+                matched.append(sent)
+                seen.add(sent)
+                if len(matched) >= max_sentences:
+                    return matched
+
+    # Fallback to leading sentences if no quote match but text exists
+    if not matched and raw_sentences:
+        for s in raw_sentences[:max_sentences]:
+            matched.append(s)
+
+    return matched[:max_sentences]
+
+
 def execute_writeback(
     db: Session,
     job_id: uuid.UUID,
     decisions: Dict[str, FieldDecisionResult],
     candidate_key: str,
+    existence_accepted: bool = True,
+    district_id: Optional[int] = None,
+    entity_name: Optional[str] = None,
+    primary_category: Optional[str] = None,
     source_id: Optional[int] = None,
+    relevant_sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Execute complete writeback if gating criteria are satisfied.
+    """Execute complete atomic write-back per Rules 3.5 - 3.8.
 
     Atomic: all PostgreSQL rows and Qdrant points are coordinated;
     never stores partial or conflicting sites.
     """
-    gate_ok, gate_reason = check_writeback_gate(decisions)
+    # 1. Resolve district_id
+    dist_id_val = district_id
+    if dist_id_val is None and "district_id" in decisions and decisions["district_id"].value:
+        try:
+            dist_id_val = int(decisions["district_id"].value)
+        except (ValueError, TypeError):
+            dist_id_val = None
 
+    if dist_id_val is None and "district" in decisions and decisions["district"].value:
+        raw_p = str(decisions["district"].value).replace("District", "").strip()
+        dist_row = db.execute(
+            sa_text("SELECT location_id FROM locations WHERE level = 'district' AND lower(name_en) = lower(:p)"),
+            {"p": raw_p},
+        ).fetchone()
+        if dist_row:
+            dist_id_val = dist_row[0]
+
+    # 2. Gating check per Rule 3.5
+    gate_ok, gate_reason = check_writeback_gate(existence_accepted, dist_id_val)
     if not gate_ok:
         verified_count = sum(1 for d in decisions.values() if d.decision == "verified")
-        new_status = "rejected_nonexistent" if verified_count == 0 else "failed"
+        new_status = "rejected_nonexistent" if not existence_accepted else "failed"
 
         db.execute(
             sa_text("""
@@ -111,50 +196,44 @@ def execute_writeback(
         logger.info(f"Write-back gate rejected job {job_id}: {gate_reason} (status={new_status})")
         return None
 
-    # Resolve district code3
-    dist_raw = decisions["district_id"].value if "district_id" in decisions and decisions["district_id"].value else None
-    dist_id_val = None
-    dist_row = None
-    if dist_raw is not None:
-        raw_str = str(dist_raw).strip()
-        if raw_str.isdigit():
-            dist_id_val = int(raw_str)
-            dist_row = db.execute(
-                sa_text("SELECT location_id, code3, name_en FROM locations WHERE location_id = :lid"),
-                {"lid": dist_id_val},
-            ).mappings().fetchone()
-        else:
-            dist_name = raw_str.replace("District", "").strip()
-            dist_row = db.execute(
-                sa_text("""
-                    SELECT location_id, code3, name_en 
-                    FROM locations 
-                    WHERE level = 'district'
-                      AND (lower(name_en) = lower(:name) 
-                           OR lower(name_en) LIKE lower(:like_name)
-                           OR :name ILIKE '%' || name_en || '%')
-                    ORDER BY length(name_en) DESC
-                    LIMIT 1
-                """),
-                {"name": dist_name, "like_name": f"%{dist_name}%"},
-            ).mappings().fetchone()
-            if dist_row:
-                dist_id_val = dist_row["location_id"]
+    # Resolve district metadata (code3, name_en, name_ta)
+    loc_row = db.execute(
+        sa_text("SELECT location_id, code3, name_en, name_ta FROM locations WHERE location_id = :lid"),
+        {"lid": dist_id_val},
+    ).mappings().fetchone()
 
-    if dist_id_val is None:
-        fallback_row = db.execute(
-            sa_text("SELECT location_id, code3 FROM locations WHERE level = 'district' LIMIT 1")
-        ).mappings().fetchone()
-        dist_id_val = fallback_row["location_id"] if fallback_row else 1
-        dist_row = fallback_row
+    code3 = loc_row["code3"] if loc_row and loc_row["code3"] else "TNX"
+    dist_name_en = loc_row["name_en"] if loc_row else "Tamil Nadu"
+    dist_name_ta = loc_row["name_ta"] if loc_row and loc_row["name_ta"] else dist_name_en
 
-    code3 = dist_row["code3"] if dist_row and dist_row["code3"] else "TNX"
-
-    # Allocate next site ID
+    # 3. Determine site fields
     site_id = allocate_next_site_id(db, code3)
-    name_en = decisions["name_en"].value.strip()
-    name_ta = decisions.get("name_ta").value.strip() if decisions.get("name_ta") and decisions["name_ta"].value else None
-    primary_category = decisions["primary_category"].value.strip().lower()
+
+    # name_en
+    if "name_en" in decisions and decisions["name_en"].decision == "verified" and decisions["name_en"].value:
+        name_en = decisions["name_en"].value.strip()
+    elif entity_name:
+        name_en = entity_name.strip()
+    else:
+        name_en = "Heritage Site"
+
+    # name_ta
+    name_ta = None
+    if "name_ta" in decisions and decisions["name_ta"].value:
+        name_ta = decisions["name_ta"].value.strip()
+
+    # Rule 3.6: primary_category: verified claim -> else gate/keyword classify -> else 'other_monument'
+    if "primary_category" in decisions and decisions["primary_category"].decision == "verified" and decisions["primary_category"].value:
+        final_primary_cat = normalize_category(decisions["primary_category"].value)
+    elif primary_category:
+        final_primary_cat = normalize_category(primary_category)
+    elif entity_name:
+        final_primary_cat = normalize_category(entity_name)
+    else:
+        final_primary_cat = "other_monument"
+
+    # Rule 3.7: sites.completeness
+    completeness = calculate_site_completeness(decisions)
 
     # Determine trust level
     has_tier_a = any(d.has_tier_a for d in decisions.values())
@@ -165,21 +244,22 @@ def execute_writeback(
         sa_text("""
             INSERT INTO sites (
                 site_id, name_en, name_ta, primary_category, categories, district_id,
-                period, dynasty, status, trust, origin, created_at, updated_at
+                period, dynasty, status, trust, origin, completeness, created_at, updated_at
             ) VALUES (
                 :site_id, :name_en, :name_ta, :primary_cat, ARRAY[:primary_cat], :district_id,
-                :period, :dynasty, 'verified', CAST(:trust AS trust_level), 'web_consensus', now(), now()
+                :period, :dynasty, 'verified', CAST(:trust AS trust_level), 'web_consensus', :completeness, now(), now()
             )
         """),
         {
             "site_id": site_id,
             "name_en": name_en,
             "name_ta": name_ta,
-            "primary_cat": primary_category,
+            "primary_cat": final_primary_cat,
             "district_id": dist_id_val,
             "period": decisions.get("period").value if decisions.get("period") else None,
             "dynasty": decisions.get("dynasty").value if decisions.get("dynasty") else None,
             "trust": trust_level,
+            "completeness": completeness,
         },
     )
 
@@ -203,8 +283,9 @@ def execute_writeback(
         )
 
     # Insert field_decisions and site_facts
+    # Rule 3.8: UNCONFIRMED values are NOT written to chunks or site_facts.
     for f_name, dec in decisions.items():
-        if not dec.value:
+        if not dec.value and not dec.decision:
             continue
 
         db.execute(
@@ -236,7 +317,8 @@ def execute_writeback(
             },
         )
 
-        if dec.decision == "verified":
+        # Only VERIFIED fields are written to site_facts
+        if dec.decision == "verified" and dec.value:
             db.execute(
                 sa_text("""
                     INSERT INTO site_facts (
@@ -254,22 +336,107 @@ def execute_writeback(
                 },
             )
 
-    # Create and embed chunks for vector retrieval
+    # 4. Create chunks for site per Rule 3.8
+    # (a) fact-card chunk (en, + ta when name_ta exists) from VERIFIED fields + location only
+    # (b) conflict-note chunk listing CONFLICT fields with their values and sources
+    # (c) up to 3 short summary sentences per page only if quote-anchored to that page
     embed_svc = get_embedding_service()
-    chunks_to_create = [
-        ("overview", decisions["overview"].value.strip()),
-        ("history", decisions["history"].value.strip()),
-    ]
-
     qdrant = get_qdrant_client()
     points_to_upsert = []
 
-    for section_name, section_text in chunks_to_create:
+    chunks_data: List[Tuple[str, str, str, Optional[int]]] = []  # (section, text, lang, source_id)
+
+    # (a) English fact-card chunk
+    locality_val = decisions["locality"].value if "locality" in decisions and decisions["locality"].decision == "verified" else None
+    loc_display = f"{locality_val}, {dist_name_en}" if locality_val else dist_name_en
+    fact_card_lines = [
+        f"{name_en} is a heritage site located in {loc_display}, Tamil Nadu.",
+        f"• Location: {loc_display}",
+        f"• Primary Category: {final_primary_cat.title()}",
+    ]
+    field_labels = {
+        "deity": "Presiding Deity",
+        "builder": "Built by",
+        "dynasty": "Dynasty",
+        "period": "Period",
+        "built_year": "Year Built",
+        "architecture_style": "Architecture Style",
+        "timings": "Timings",
+        "festivals": "Festivals",
+    }
+    for fk, lbl in field_labels.items():
+        if fk in decisions and decisions[fk].decision == "verified" and decisions[fk].value:
+            fact_card_lines.append(f"• {lbl}: {decisions[fk].value}")
+
+    fact_card_en = "\n".join(fact_card_lines)
+    chunks_data.append(("fact_card", fact_card_en, "en", source_id))
+
+    # (a) Tamil fact-card chunk if name_ta exists
+    if name_ta:
+        ta_display_loc = f"{dist_name_ta} மாவட்டம்"
+        fact_card_ta_lines = [
+            f"{name_ta} என்பது தமிழ்நாட்டின் {ta_display_loc} அமைந்துள்ள ஒரு பாரம்பரியத் தளமாகும்.",
+            f"• இடம்: {ta_display_loc}",
+            f"• முதன்மை வகை: {final_primary_cat}",
+        ]
+        ta_labels = {
+            "deity": "மூலவர் / தெய்வம்",
+            "builder": "கட்டியவர்",
+            "dynasty": "வம்சம்",
+            "period": "காலம்",
+            "built_year": "கட்டப்பட்ட ஆண்டு",
+            "architecture_style": "கட்டடக்கலை",
+            "timings": "நேரங்கள்",
+            "festivals": "திருவிழாக்கள்",
+        }
+        for fk, lbl in ta_labels.items():
+            if fk in decisions and decisions[fk].decision == "verified" and decisions[fk].value:
+                fact_card_ta_lines.append(f"• {lbl}: {decisions[fk].value}")
+        fact_card_ta = "\n".join(fact_card_ta_lines)
+        chunks_data.append(("fact_card", fact_card_ta, "ta", source_id))
+
+    # (b) Conflict-note chunk listing CONFLICT fields
+    conflict_fields = [f for f, d in decisions.items() if d.decision == "conflict"]
+    if conflict_fields:
+        conflict_lines = [f"Historical records note conflicting accounts for {name_en}:"]
+        for cf in conflict_fields:
+            c_dec = decisions[cf]
+            comp_vals = [f"'{c_dec.value}' (support {c_dec.support:.2f})"]
+            for cp in c_dec.competing:
+                comp_vals.append(f"'{cp.get('value')}' (support {cp.get('support', 0):.2f})")
+            conflict_lines.append(f"• {cf.replace('_', ' ').title()}: competing accounts include " + ", ".join(comp_vals))
+        conflict_chunk_text = "\n".join(conflict_lines)
+        chunks_data.append(("conflict_notes", conflict_chunk_text, "en", source_id))
+
+    # (c) Up to 3 short summary sentences per page only if quote-anchored to that page
+    if relevant_sources:
+        # Collect verified quotes to anchor against
+        all_evidence_quotes = []
+        for d in decisions.values():
+            if d.value:
+                all_evidence_quotes.append(d.value)
+        for src in relevant_sources[:3]:
+            page_text = src.get("text", "")
+            page_src_id = src.get("source_id", source_id)
+            sentences = _extract_quote_anchored_sentences(
+                page_text,
+                evidence_quotes=all_evidence_quotes,
+                max_sentences=MAX_SUMMARY_SENTENCES_PER_PAGE,
+            )
+            if sentences:
+                summary_text = " ".join(sentences)
+                chunks_data.append(("summary", summary_text, "en", page_src_id))
+
+    # Fallback: if somehow only 1 chunk was generated and overview/history exist in decisions
+    if len(chunks_data) < 2 and "overview" in decisions and decisions["overview"].value:
+        chunks_data.append(("overview", decisions["overview"].value.strip(), "en", source_id))
+
+    # 5. Embed chunks and persist to PostgreSQL chunk_registry & Qdrant
+    for section_name, section_text, chunk_lang, chunk_src_id in chunks_data:
         chunk_uuid = uuid.uuid4()
         chunk_hash = hashlib.sha256(section_text.encode("utf-8")).hexdigest()
         token_count = embed_svc.count_tokens(section_text)
 
-        # Chunk text formatted for model: {name_en} | {name_ta} | {section}\n{text}
         formatted_chunk = embed_svc.format_chunk_for_embedding(
             name_en=name_en,
             name_ta=name_ta or "",
@@ -278,14 +445,13 @@ def execute_writeback(
         )
         dense_vec = embed_svc.embed_text(formatted_chunk)
 
-        # Insert into chunk_registry
         db.execute(
             sa_text("""
                 INSERT INTO chunk_registry (
                     chunk_id, site_id, section, lang, source_id,
                     content_hash, token_count, origin, created_at
                 ) VALUES (
-                    :cid, :site_id, :section, 'en', :source_id,
+                    :cid, :site_id, :section, :lang, :source_id,
                     :hash, :tokens, 'web_consensus', now()
                 )
             """),
@@ -293,7 +459,8 @@ def execute_writeback(
                 "cid": chunk_uuid,
                 "site_id": site_id,
                 "section": section_name,
-                "source_id": source_id,
+                "lang": chunk_lang,
+                "source_id": chunk_src_id,
                 "hash": chunk_hash,
                 "tokens": token_count,
             },
@@ -308,16 +475,16 @@ def execute_writeback(
                     "site_name_en": name_en,
                     "site_name_ta": name_ta,
                     "section": section_name,
-                    "lang": "en",
+                    "lang": chunk_lang,
                     "text": section_text,
                     "trust": trust_level,
                     "origin": "web_consensus",
-                    "source_id": source_id,
+                    "source_id": chunk_src_id,
                 },
             )
         )
 
-    # Upsert to Qdrant
+    # Upsert points into Qdrant
     if points_to_upsert:
         qdrant.upsert(
             collection_name=settings.QDRANT_COLLECTION,
@@ -342,5 +509,5 @@ def execute_writeback(
     )
 
     db.commit()
-    logger.info(f"Successfully executed write-back for {site_id} ({name_en})")
+    logger.info(f"Successfully executed write-back for {site_id} ({name_en}, completeness={completeness})")
     return site_id

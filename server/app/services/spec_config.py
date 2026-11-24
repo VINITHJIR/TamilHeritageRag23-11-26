@@ -122,6 +122,46 @@ CONSENSUS_WEIGHT_SUM_THRESHOLD: float = 1.20
 # Rule 3.3: Minimum support_ratio(v) for competing values to trigger CONFLICT
 CONFLICT_SUPPORT_RATIO_MIN: float = 0.20
 
+# Rule 3.3: Numeric tolerance ratio (±5%) for numeric conflict merging
+NUMERIC_TOLERANCE_RATIO: float = 0.05
+
+# Rule 3.4: Extracted claim fields subject to consensus (overview and history are NOT consensus fields)
+CONSENSUS_FIELDS: list[str] = [
+    "name_ta",
+    "primary_category",
+    "deity",
+    "builder",
+    "dynasty",
+    "period",
+    "built_year",
+    "festivals",
+    "architecture_style",
+    "timings",
+    "locality",
+]
+
+# Rule 3.7: Optional fields for sites.completeness calculation
+OPTIONAL_FIELDS: list[str] = [
+    "deity",
+    "builder",
+    "dynasty",
+    "period",
+    "built_year",
+    "festivals",
+    "architecture_style",
+    "timings",
+    "locality",
+    "name_ta",
+]
+
+# Rule 3.7: sites.completeness thresholds (existence_only <= 1, partial 2-3, complete >= 4)
+COMPLETENESS_EXISTENCE_ONLY_MAX: int = 1
+COMPLETENESS_PARTIAL_MAX: int = 3
+COMPLETENESS_COMPLETE_MIN: int = 4
+
+# Rule 3.8: Maximum quote-anchored summary sentences per page for chunks
+MAX_SUMMARY_SENTENCES_PER_PAGE: int = 3
+
 # Rule 4.2: Maximum options to present in value choice prompt
 MAX_VALUE_CHOICES: int = 4
 

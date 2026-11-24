@@ -49,3 +49,9 @@ CREATE TABLE IF NOT EXISTS option_choices (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS option_choices_message_id_idx ON option_choices(message_id);
+
+-- 5. FIELD_DECISIONS decision constraint update for unconfirmed (Rule 3.3)
+ALTER TABLE field_decisions DROP CONSTRAINT IF EXISTS field_decisions_decision_check;
+ALTER TABLE field_decisions ADD CONSTRAINT field_decisions_decision_check CHECK (
+  decision IN ('verified', 'conflict', 'unconfirmed', 'rejected', 'expired')
+);
