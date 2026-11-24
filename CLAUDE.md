@@ -105,3 +105,60 @@ npm run dev
 ```powershell
 .\server\.venv\Scripts\python.exe -m pytest .\server\tests -v
 ```
+
+
+---
+
+## v0.4.1-clarify — CLARIFY-THEN-AUGMENT State Machine
+
+### Overview
+
+Before running the full IC³-WB augmentation pipeline, the system now detects
+**ambiguous temple queries** (e.g. "are you know about ponniamman temple") and
+asks the user to pick a location. Only after a location is confirmed does it
+run the full augmentation.
+
+### State Machine (Mermaid)
+
+```mermaid
+flowchart TD
+    A([User Message]) --> B{Open clarification?}
+    B -- Yes --> C[clarify.py: resolve reply]
+    C -- resolved --> D[Enrich query with locality+district]
+    C -- cancelled --> E[Process as new query]
+    C -- unresolved --> F[Re-show options]
+    B -- No --> G{Ambiguous entity?}
+    G -- No / specific site --> H[Normal IC³-WB pipeline]
+    G -- Yes --> I[disambiguate.py: candidate discovery]
+    I --> J{How many candidates?}
+    J -- 0 --> K[rejected_nonexistent → polite refusal]
+    J -- 1 --> H
+    J -- ≥2 --> L[Create clarification row in DB]
+    L --> M[Return needs_clarification + options]
+    M --> N([UI shows chips + free-text hint])
+    N --> A
+    D --> H
+    E --> H
+    H --> O([Answer returned to user])
+```
+
+### New Files (v0.4.1)
+
+| File | Purpose |
+|------|---------|
+| `server/migrations/004_clarifications.sql` | Adds `clarifications` and `candidate_cache` tables |
+| `server/app/models/clarification.py` | SQLAlchemy ORM for `clarifications` |
+| `server/app/models/candidate_cache.py` | SQLAlchemy ORM for `candidate_cache` |
+| `server/app/services/clarifications.py` | CRUD: create, get_open, resolve, cancel |
+| `server/app/augment/disambiguate.py` | Candidate discovery + ambiguity gate |
+| `server/app/augment/clarify.py` | Clarification reply resolution |
+| `server/app/api/routes/clarifications.py` | REST endpoints: GET /open, POST /respond |
+| `server/tests/test_clarify_flow.py` | Unit tests for the clarification flow |
+
+### Behaviour
+
+- **At most one open clarification per session** — expires after 30 minutes.
+- **Chip click** sends `{clarification_id, option_id}` → direct resolution.
+- **Free text** (locality or Tamil transliteration) → fuzzy match with score ≥ 85.
+- **Unrelated new query** → cancels current clarification, processes normally.
+- **Candidate cache** (TTL 30 days) avoids repeat web calls for the same entity.

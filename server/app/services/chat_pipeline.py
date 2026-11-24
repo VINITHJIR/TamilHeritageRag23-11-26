@@ -584,6 +584,32 @@ def process_chat_message(
                 _IDEMPOTENCY_CACHE[(str(session_id), str(idempotency_key).strip())] = resp
             return resp
 
+    # 0b. CLARIFY-THEN-AUGMENT pre-hook
+    # ── Check if there is an open clarification for this session. ──────────
+    # Import here to avoid circular import at module level.
+    try:
+        from app.augment.clarify import process_clarification_reply
+        from app.services.clarifications import get_open_clarification
+        from app.augment.disambiguate import disambiguate_query
+
+        open_clar = get_open_clarification(db, str(session_id))
+        if open_clar:
+            # Route user reply through the resolution module.
+            clar_result = process_clarification_reply(
+                db, str(session_id), {"text": clean_content}
+            )
+            if clar_result["status"] == "resolved":
+                selected = clar_result["selected_candidate"]
+                # Merge locality/district into clean_content for the downstream query
+                clean_content = (
+                    f"{open_clar.entity_name} {selected.get('locality', '')} {selected.get('district', '')}".strip()
+                )
+                # fall through to normal pipeline with enriched query
+            # If cancelled → fall through with original query
+            # If unresolved → show options again (fall through; disambiguate will re-open)
+    except Exception as _clar_err:
+        logger.warning(f"Clarification pre-hook failed (non-fatal): {_clar_err}")
+
     # 1. Language detection
     detected_lang = detect_language(clean_content)
 

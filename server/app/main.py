@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import admin, chat, health, search, sites, users
+from app.api.routes import admin, chat, clarifications, health, search, sites, users
 from app.core.config import settings
 from app.services.embeddings import get_embedding_service
 
@@ -52,6 +52,7 @@ app.include_router(search.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(clarifications.router, prefix="/api")
 
 
 @app.get("/")
